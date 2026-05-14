@@ -467,8 +467,7 @@ if not activity_df.empty:
         "Field",
         "Old Value",
         "New Value",
-        "Note",
-        "Timestamp"
+        "Note"
     ]
     st.dataframe(activity_view[display_cols], width="stretch", hide_index=True)
 else:
