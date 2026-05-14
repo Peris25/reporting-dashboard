@@ -335,6 +335,7 @@ editable_cols = [
     "Summary",
     "Status",
     "Priority",
+    "Created",
     "Diagnosed At",
     "Resolved At",
     "Updated At",
@@ -350,9 +351,10 @@ edited = st.data_editor(
     column_config={
         "Ticket ID": st.column_config.TextColumn("Ticket ID", disabled=True),
         "Status": st.column_config.SelectboxColumn("Status", options=STATUSES),
-        "Diagnosed At": st.column_config.TextColumn("Diagnosed At", disabled=True),
-        "Resolved At": st.column_config.TextColumn("Resolved At", disabled=True),
-        "Updated At": st.column_config.TextColumn("Updated At", disabled=True),
+        "Created": st.column_config.TextColumn("Created", help="Format: YYYY-MM-DD HH:MM:SS"),
+        "Diagnosed At": st.column_config.TextColumn("Diagnosed At", help="Format: YYYY-MM-DD HH:MM:SS"),
+        "Resolved At": st.column_config.TextColumn("Resolved At", help="Format: YYYY-MM-DD HH:MM:SS"),
+        "Updated At": st.column_config.TextColumn("Updated At", help="Format: YYYY-MM-DD HH:MM:SS"),
         "Diagnosis SLA": st.column_config.TextColumn("Diagnosis SLA", disabled=True),
         "Resolution SLA": st.column_config.TextColumn("Resolution SLA", disabled=True),
     },
@@ -385,11 +387,32 @@ with st.form("save_edits_form"):
             new_status = normalize_text(upd.loc[tid, "Status"]).lower()
             now_stamp = datetime.now().isoformat(timespec="seconds")
 
+            new_created = normalize_text(upd.loc[tid, "Created"])
+            old_created = normalize_text(base_idx.loc[tid, "Created"])
+            new_diagnosed_at = normalize_text(upd.loc[tid, "Diagnosed At"])
+            old_diagnosed_at = normalize_text(base_idx.loc[tid, "Diagnosed At"])
+            new_resolved_at = normalize_text(upd.loc[tid, "Resolved At"])
+            old_resolved_at = normalize_text(base_idx.loc[tid, "Resolved At"])
+            new_updated_at = normalize_text(upd.loc[tid, "Updated At"])
+            old_updated_at = normalize_text(base_idx.loc[tid, "Updated At"])
+
             if old_summary != new_summary:
                 base_idx.loc[tid, "Summary"] = new_summary
 
             if old_priority != new_priority:
                 base_idx.loc[tid, "Priority"] = new_priority
+
+            if new_created and new_created != old_created:
+                base_idx.loc[tid, "Created"] = new_created
+                append_activity(activity_ws, ticket_id=tid, action="field_edited", field="Created", old_value=old_created, new_value=new_created, note=update_note.strip())
+
+            if new_diagnosed_at != old_diagnosed_at:
+                base_idx.loc[tid, "Diagnosed At"] = new_diagnosed_at
+                append_activity(activity_ws, ticket_id=tid, action="field_edited", field="Diagnosed At", old_value=old_diagnosed_at, new_value=new_diagnosed_at, note=update_note.strip())
+
+            if new_resolved_at != old_resolved_at:
+                base_idx.loc[tid, "Resolved At"] = new_resolved_at
+                append_activity(activity_ws, ticket_id=tid, action="field_edited", field="Resolved At", old_value=old_resolved_at, new_value=new_resolved_at, note=update_note.strip())
 
             if old_status != new_status:
                 append_activity(activity_ws, ticket_id=tid, action="status_changed", field="Status", old_value=old_status, new_value=new_status, note=update_note.strip())
@@ -408,7 +431,11 @@ with st.form("save_edits_form"):
             if update_note.strip():
                 append_activity(activity_ws, ticket_id=tid, action="note_added", field="Note", old_value="", new_value=update_note.strip(), note=update_note.strip())
 
-            base_idx.loc[tid, "Updated At"] = now_stamp
+            if new_updated_at != old_updated_at and new_updated_at:
+                base_idx.loc[tid, "Updated At"] = new_updated_at
+                append_activity(activity_ws, ticket_id=tid, action="field_edited", field="Updated At", old_value=old_updated_at, new_value=new_updated_at, note=update_note.strip())
+            else:
+                base_idx.loc[tid, "Updated At"] = now_stamp
 
         base2 = base_idx.reset_index()
         write_df(ws, base2, REQUIRED_HEADERS)
@@ -467,7 +494,7 @@ if not activity_df.empty:
         "Field",
         "Old Value",
         "New Value",
-        "Note"
+        "Note",
     ]
     st.dataframe(activity_view[display_cols], width="stretch", hide_index=True)
 else:
