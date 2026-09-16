@@ -2,3 +2,7 @@ streamlit
 pandas
 gspread
 google-auth
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+alembic>=1.14,<2
+altair>=5,<7

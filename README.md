@@ -1,0 +1,167 @@
+# Reporting Dashboard
+
+Solvit's internal support dashboard, built with Streamlit and PostgreSQL. It tracks first response, diagnosis, closure, and turnaround time (TAT) for Solver, Solvit Office Team, and External Clients requests. Google Sheets remains available as a migration fallback.
+
+## Features
+
+- Filters and free-text search
+- First response within 30 minutes, diagnosis within 2 hours, and closure within 48 hours
+- One SLA summary and an attention list for overdue or unassigned open requests
+- SLA outcome bar chart and open-versus-closed doughnut chart, both following dashboard filters
+- CSV report export
+- Email and WhatsApp click-to-share actions
+- Ticket creation, change-only editing, and deletion
+- Per-field activity logging
+- Optional password access gate
+- Targeted Google Sheets updates that preserve unrelated rows
+- Normalized Jira CSV import with repeat-import deduplication
+- Four overview cards: open, needing attention, closed, and average closure turnaround time
+- Validated ticket workflow transitions
+- Mark responded / Mark diagnosed buttons that save the current form and record the time
+- Live deadline countdowns and analytics that refresh every 10 minutes without rerunning intake/edit forms
+- Assigned-agent and unassigned filters, with an open-request ownership list
+- Downloadable last-seven-days versus previous-seven-days comparison
+- Vehicle registration (Reg No) in Solver intake, search, request details, and CSV exports
+- Official Solvit website logo in the login screen, sidebar, and dashboard header
+
+## Using the dashboard
+
+1. Under **Who needs support?**, select **Solver**, **Solvit Office Team**, or **External Clients**. Solver requests require a Job Request ID and allow an optional **Reg No**, such as `KDA 123A`. External client requests allow optional Job Request ID and Reg No, without an office department. All types capture the requester's name, contact details, and issue, and use the same SLA targets. Choose the actual reporting time; dashboard entry time is recorded automatically.
+2. Assign a support agent at intake or under **Manage support requests**. Use **Assigned agent → Unassigned** to find requests needing an owner.
+3. After responding, click **Mark responded**. Once the problem is understood, click **Mark diagnosed**. Each button records the time now and saves the current form edits. Mark diagnosed moves a To do request to Diagnosed.
+4. Use the date/time fields to correct an earlier response or diagnosis time. Enter Nairobi time. New timestamps must fall between reporting and now, and cannot be later than closure for a closed request. Previously recorded milestones are not overwritten by the quick-action buttons.
+5. To close an issue, select **Closed**, provide a **Resolution summary**, and save. Any open status can move directly to Closed. Editing the summary alone does not close the request.
+6. Read **History for this request** for the selected request's changes. Creation and intake are combined into one readable entry. History entries are updates to one request, not additional requests.
+
+Existing Solver IDs remain stored separately for compatibility; they are not reinterpreted as vehicle registrations. The registration migration adds a new `reg_no` column. Google Sheets appends the new header without shifting existing data.
+
+## SLA and turnaround time
+
+| Milestone | Target from reporting | Recorded timestamp |
+|---|---|---|
+| First response | 30 minutes | `First Response At` |
+| Diagnosis / understanding the problem | 2 hours | `Diagnosed At` |
+| Closure | 48 hours | `Closed At` |
+
+All three clocks start together at the actual reporting time; they are not sequential stages. **TAT is total elapsed time from reporting to closure.** A milestone completed exactly at its deadline is on time.
+
+Choose **Reported at (Nairobi time)** when creating a request. For example, a
+ticket received on 9 September at 9 PM can be entered the next day with the original
+reporting timestamp. `Reported At` stores this time; `Created` separately records
+when the ticket was entered in the dashboard. Both appear in request details and
+exports. The activity history retains the time each dashboard action occurred.
+Call, WhatsApp, SMS, Email, and Other channels are available.
+
+SLA targets use elapsed time (24/7) from `Reported At`. Existing records without
+that field fall back to `Created` until their reporting time is corrected in the
+edit form. Corrections are logged in history and cannot be in the future, after
+dashboard entry, or after a recorded response, diagnosis, or closure. First response and
+diagnosis times can be recorded in Nairobi time when editing a request; moving
+into diagnosis or a later working stage records diagnosis if it is missing.
+Direct closure does not invent a response or diagnosis time. Closure records
+`Closed At`; deployment does not stop the closure clock. Reopening clears the
+closure timestamp and resumes the clock from the original reporting time.
+
+Turnaround time is reported to closed. Averages and on-time percentages use
+recorded milestones only; pending and missing records never imply 100% compliance.
+Closed historical records with missing milestone times show as not recorded.
+Existing saved timestamps are retained; previously inferred diagnosis timestamps
+cannot be distinguished automatically from actual observations. The new targets
+also apply to historical requests in filtered reports.
+
+The SLA table distinguishes recorded on-time and late milestones, work still waiting within target, overdue milestones, and missing or invalid timestamps. Completed-late milestones remain visible in performance statistics but no longer require that milestone to be performed.
+
+## Analytics and reports
+
+- **Four overview cards:** open requests, requests needing attention, closed requests, and average closure TAT. Needs attention counts each open request once if it is overdue or unassigned.
+- **SLA bar chart:** one bar per milestone showing on-time, late, waiting, overdue, and missing/invalid counts. Each bar evaluates the same requests against a different target.
+- **Open/closed doughnut chart:** one count per request. Deployed requests remain open until Closed.
+- **Attention list and ownership:** identify the responsible agent, missing assignments, and overdue actions. Expand **Open requests and owners** for the full filtered open workload.
+- **Deadline countdowns:** the selected request shows time remaining or time overdue for each milestone, with warning colours near the deadline. Completed milestones show their recorded duration.
+- **Filtered CSV:** follows status, priority, created month, assigned-agent, and search filters. Includes Reg No, milestone times, durations in hours, and SLA outcomes.
+- **Weekly comparison and download:** expandable summary of logged and closed counts, each milestone's on-time percentage, and average closure TAT, with a CSV download.
+
+Analytics, filtered exports, and selected-request deadline messages refresh every **10 minutes** while the page session is active. Refreshing those sections does not rerun the intake/edit forms. The analytics show their last refresh time in Nairobi time. Reload the page to refresh request-selector choices after another user creates a request.
+
+The weekly comparison covers all requests independently of dashboard filters.
+Logged counts use logging dates; closure counts and TAT use closure dates.
+Each SLA percentage uses the corresponding milestone timestamps in that window.
+Reopened requests are counted as closed only once they are closed again, using
+their latest closure timestamp. Timer refreshes run while the dashboard session
+is active; they do not send messages or run a background notification service.
+
+## Local setup
+
+1. Create a Python virtual environment.
+2. Install packages with `pip install -r requirements.txt`.
+3. Set `DATABASE_URL` to a PostgreSQL URL. If it is omitted, development uses the ignored local `reporting.db` SQLite file.
+4. Run `alembic upgrade head`.
+5. Run `streamlit run app.py`.
+
+Use `.env.example` as a configuration reference; the application does not automatically load a `.env` file. Set environment variables in your shell or hosting configuration. Run `alembic upgrade head` after pulling changes so an existing database receives new fields, including Reg No.
+
+### Google Sheets fallback
+
+To temporarily use the old Google Sheets backend, set `USE_DATABASE=false`, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, and configure the service account. The tickets worksheet must use these columns in this exact order:
+
+```text
+Ticket ID, Summary, Status, Priority, Created, Diagnosed At, Resolved At, Updated At
+```
+
+The activity worksheet is created automatically if it does not exist.
+
+Existing worksheets using the original eight ticket columns are extended automatically with the reporting fields. Existing data and column order are preserved. New deployments should use PostgreSQL.
+
+## Render deployment
+
+To move off Render completely, follow [Streamlit Community Cloud + Neon setup and data transfer](docs/streamlit-cloud.md).
+The app supports automatic migrations with `AUTO_MIGRATE=true`; use the supplied
+Community Cloud secrets template to require PostgreSQL and preserve durable data.
+
+`render.yaml` defines one Streamlit web service and one Render PostgreSQL database in the same Frankfurt region. Render injects the database's private `connectionString` as `DATABASE_URL`; no database password is committed to the repository.
+
+1. Push the project to a private GitHub repository.
+2. In Render, create a Blueprint from that repository.
+3. Supply `DASHBOARD_PASSWORD_HASH`, `SUPPORT_EMAIL`, and `SUPPORT_WHATSAPP` when prompted.
+4. Deploy. Render installs dependencies, applies Alembic migrations, and starts Streamlit on the assigned port.
+
+For the existing service, pushes go to `main` in `Parkire-Solvit/reporting-dashboard`. If that is the service's linked branch and auto-deploy is enabled, a push triggers deployment. Check the service's Events page for the intended commit and a successful deployment before expecting changes on the live dashboard.
+
+The database blocks public inbound connections in the Blueprint. Render's web service connects over its private network.
+
+## Jira import
+
+Open **Import and normalize Jira data**, upload the raw Jira CSV, inspect the preview, and then import. The importer supports Jira's repeated CSV headers, maps legacy statuses into the dashboard workflow, and generates a stable UUID from each Jira issue key. Uploading the same issues again will not duplicate them.
+
+## Tests
+
+Install development dependencies and run:
+
+```text
+pip install -r requirements-dev.txt
+pytest
+```
+
+Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
+
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, and preservation of legacy Solver IDs during migration. App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 31 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+
+## Branding
+
+The logo is bundled at `assets/solvit-logo.jpg`, sourced unchanged from Solvit's official website. See [asset source details](assets/README.md). It is embedded locally, so displaying it does not require a request to the company website.
+
+## Security
+
+Never commit `.streamlit/secrets.toml` or raw Jira exports. Configure `DASHBOARD_PASSWORD_HASH` for the built-in access gate. For a larger team, replace the shared password with an identity provider and role-based permissions.
+
+## Notifications
+
+`SUPPORT_EMAIL` enables a prefilled email action and `SUPPORT_WHATSAPP` enables a prefilled WhatsApp action. These deliberately require a user to confirm sending. Automated alerts require a mail service and the WhatsApp Business Cloud API, including approved credentials and message templates.
+
+## Production direction
+
+PostgreSQL is the primary store. For this two-person internal tool, the password gate is a practical first deployment. Organization SSO, named users, backups, monitoring, and scheduled SLA alerts remain the next production hardening steps.
+
+Reporting date and time start blank and must be selected before creating a request. Use the refresh buttons for immediate analytics or deadline updates between automatic refreshes. Saving a request also updates the dashboard.
+
+New support requests do not ask for a requester name. Existing saved requester names remain available in historical records.
