@@ -203,7 +203,7 @@ def render_kpi_cards(cards):
     st.markdown(html + "</div>", unsafe_allow_html=True)
 
 
-def render_sidebar_header():
+def render_sidebar_header(workspace_name="Support"):
     st.sidebar.markdown(
         f"""
         <div class="sidebar-brand">
@@ -212,7 +212,7 @@ def render_sidebar_header():
         </div>
         <div class="workspace-card">
           <div class="workspace-label">Internal workspace</div>
-          <div class="workspace-name"><span>IT Support</span><span class="live-dot">LIVE</span></div>
+          <div class="workspace-name"><span>{workspace_name}</span><span class="live-dot">LIVE</span></div>
         </div>
         <div class="sidebar-section">Report controls</div>
         """,
