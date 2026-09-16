@@ -116,6 +116,7 @@ class DraftRequest(Base):
     reviewed_by: Mapped[str | None] = mapped_column(String(200))
     review_note: Mapped[str | None] = mapped_column(Text)
     approved_ticket_id: Mapped[str | None] = mapped_column(String(36))
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
 
 
 TICKET_MAP = {
@@ -333,7 +334,7 @@ _DRAFT_FIELDS = (
     "draft_id", "source", "source_reference", "status", "summary", "description",
     "category", "priority", "suggested_department", "suggested_subteam",
     "requester_name", "contact", "reported_at", "excerpt", "created_at",
-    "reviewed_at", "reviewed_by", "review_note", "approved_ticket_id",
+    "reviewed_at", "reviewed_by", "review_note", "approved_ticket_id", "source_fingerprint",
 )
 
 
@@ -369,8 +370,15 @@ class DraftStore:
                 reported_at=values.get("reported_at"),
                 excerpt=values.get("excerpt"),
                 created_at=values.get("created_at") or now,
+                source_fingerprint=values.get("source_fingerprint"),
             ))
         return draft_id
+
+    def fingerprints(self):
+        """All known fingerprints across every status, for de-duplication."""
+        with self.session_factory() as session:
+            rows = session.scalars(select(DraftRequest.source_fingerprint)).all()
+        return {value for value in rows if value}
 
     def list(self, status="pending"):
         with self.session_factory() as session:

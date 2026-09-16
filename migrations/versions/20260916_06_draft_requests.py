@@ -32,12 +32,15 @@ def upgrade():
             sa.Column("reviewed_by", sa.String(200), nullable=True),
             sa.Column("review_note", sa.Text(), nullable=True),
             sa.Column("approved_ticket_id", sa.String(36), nullable=True),
+            sa.Column("source_fingerprint", sa.String(64), nullable=True),
         )
         op.create_index("ix_draft_requests_status", "draft_requests", ["status"])
+        op.create_index("ix_draft_requests_source_fingerprint", "draft_requests", ["source_fingerprint"])
 
 
 def downgrade():
     inspector = sa.inspect(op.get_bind())
     if "draft_requests" in set(inspector.get_table_names()):
+        op.drop_index("ix_draft_requests_source_fingerprint", table_name="draft_requests")
         op.drop_index("ix_draft_requests_status", table_name="draft_requests")
         op.drop_table("draft_requests")
