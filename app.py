@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 from urllib.parse import quote
 import hashlib
@@ -16,8 +16,10 @@ from reporting.views import render_department_breakdown, render_reporting_views,
 from reporting.analytics import filter_requests, milestone_deadlines
 from reporting.workflow import can_transition
 from reporting.history import request_history
-from reporting.database import create_user_store, database_handles
+from reporting.database import create_draft_store, create_user_store, database_handles
 from reporting.bootstrap import initialize_database
+from reporting.whatsapp import parse_export, parse_timestamp
+from reporting.intake import extract_issues, DEFAULT_CATEGORIES
 from reporting.access import (
     CurrentUser, can_delete, can_manage, clean_subteam, hash_password, verify_password, visible_tickets,
 )
@@ -57,8 +59,13 @@ DASHBOARD_PASSWORD_HASH = setting("DASHBOARD_PASSWORD_HASH")
 # global view.
 BOOTSTRAP_ADMIN_USER = str(setting("DASHBOARD_ADMIN_USER")).strip()
 BOOTSTRAP_ADMIN_PASSWORD = setting("DASHBOARD_ADMIN_PASSWORD")
+# WhatsApp intake uses OpenAI to split and categorise chats when a key is set;
+# without one it falls back to a single heuristic draft.
+OPENAI_API_KEY = setting("OPENAI_API_KEY")
+OPENAI_MODEL = setting("OPENAI_MODEL", "gpt-4o-mini")
 
 REQUIRED_HEADERS = TICKET_HEADERS
+INTAKE_CATEGORIES = DEFAULT_CATEGORIES
 
 
 # ---- Google Sheets helpers ----
@@ -182,6 +189,33 @@ def normalize_text(value):
     return str(value).strip()
 
 
+def option_index(options, value, default=0):
+    text = str(value or "").strip().lower()
+    for position, option in enumerate(options):
+        if option.lower() == text:
+            return position
+    return default
+
+
+def read_whatsapp_upload(raw_bytes, filename):
+    """Return the chat text from a .txt export or the _chat.txt inside a .zip."""
+    if str(filename).lower().endswith(".zip"):
+        import io
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+            names = [name for name in archive.namelist() if name.lower().endswith(".txt")]
+            preferred = next((name for name in names if "_chat" in name.lower()), names[0] if names else None)
+            return archive.read(preferred).decode("utf-8", errors="replace") if preferred else ""
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+@st.cache_data(show_spinner=False)
+def parse_whatsapp_cached(raw_bytes, filename):
+    """Parse an upload once and reuse across reruns (large exports are slow)."""
+    return parse_export(read_whatsapp_upload(raw_bytes, filename))
+
+
 def parse_dt(series_or_value):
     return pd.to_datetime(series_or_value, errors="coerce")
 
@@ -255,6 +289,12 @@ def require_login():
 def get_user_store():
     configured_url = setting("DATABASE_URL")
     return create_user_store(configured_url or None)
+
+
+@st.cache_resource
+def get_draft_store():
+    configured_url = setting("DATABASE_URL")
+    return create_draft_store(configured_url or None)
 
 
 def current_user_from(account):
@@ -546,6 +586,157 @@ with st.expander("Import and normalize Jira data"):
                 ]
                 activity_ws.append_rows(activity_rows)
                 st.success(f"Imported {len(new_rows)} new Jira ticket(s).")
+                st.rerun()
+
+st.divider()
+
+# ---- WhatsApp intake ----
+if USE_DATABASE:
+    draft_store = get_draft_store()
+    with st.expander("Import from WhatsApp"):
+        st.caption(
+            "Upload an exported WhatsApp chat (.txt or .zip), choose a date range, and scan it. "
+            "Genuine issues (complaints, app misbehaviour, improvement suggestions) become draft "
+            "requests you review below. Routine chatter (approvals, dispatch, logbooks) is ignored. "
+            + ("AI extraction is on." if OPENAI_API_KEY else "No OpenAI key set, so a keyword fallback is used (lower quality).")
+        )
+        wa_upload = st.file_uploader("WhatsApp chat export", type=["txt", "zip"], key="whatsapp_import")
+        if wa_upload is not None:
+            messages = parse_whatsapp_cached(wa_upload.getvalue(), wa_upload.name)
+            convo = [m for m in messages if not m["system"] and m["sender"]]
+            stamps = [s for s in (parse_timestamp(m["timestamp"]) for m in convo if m["timestamp"]) if pd.notna(s)]
+            if not stamps:
+                st.warning("No dated messages were found. Export the chat without media and try again.")
+            else:
+                min_date, max_date = min(stamps).date(), max(stamps).date()
+                st.caption(f"Chat spans {min_date:%d %b %Y} to {max_date:%d %b %Y} ({len(convo)} messages).")
+                default_start = max(min_date, max_date - timedelta(days=7))
+                range_left, range_right = st.columns(2)
+                start_date = range_left.date_input("From", value=default_start, min_value=min_date, max_value=max_date, key="wa_from")
+                end_date = range_right.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key="wa_to")
+                if start_date > end_date:
+                    st.error("The 'From' date must be on or before the 'To' date.")
+                else:
+                    windowed = [
+                        m for m in convo
+                        if (ts := parse_timestamp(m["timestamp"])) is not None and pd.notna(ts)
+                        and start_date <= ts.date() <= end_date
+                    ]
+                    st.caption(f"{len(windowed)} messages in the selected range.")
+                    if len(windowed) > 3000:
+                        st.warning("That is a large range. Narrow the dates to keep the scan fast and within API limits.")
+                    if st.button("Scan range for issues", key="scan_whatsapp", disabled=not windowed):
+                        with st.spinner("Reading messages and drafting issues…"):
+                            issues = extract_issues(
+                                windowed, categories=INTAKE_CATEGORIES,
+                                api_key=OPENAI_API_KEY or None, model=OPENAI_MODEL,
+                            )
+                            known = draft_store.fingerprints()
+                            added = 0
+                            for issue in issues:
+                                if issue["source_fingerprint"] in known:
+                                    continue
+                                draft_store.add({
+                                    **issue, "source": "whatsapp",
+                                    "source_reference": f"{wa_upload.name} [{start_date}..{end_date}]",
+                                })
+                                known.add(issue["source_fingerprint"])
+                                added += 1
+                        skipped = len(issues) - added
+                        if added:
+                            st.success(f"Created {added} draft(s)" + (f", skipped {skipped} already seen." if skipped else "."))
+                            st.rerun()
+                        else:
+                            st.info("No new issues found in that range." + (f" ({skipped} already seen.)" if skipped else ""))
+
+    # ---- Pending intake (drafts awaiting approval) ----
+    pending_drafts = draft_store.list("pending")
+    visible_drafts = [
+        draft for draft in pending_drafts
+        if view_all_user
+        or not normalize_department(draft["suggested_department"])
+        or normalize_department(draft["suggested_department"]) == current_user.department
+    ]
+    st.subheader(f"Pending intake ({len(visible_drafts)})")
+    st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
+    if not visible_drafts:
+        st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
+    priority_choices = ["Low", "Medium", "High", "Highest"]
+    for draft in visible_drafts:
+        did = draft["draft_id"]
+        header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
+        with st.expander(header):
+            summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
+            description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                category = st.selectbox("Category", INTAKE_CATEGORIES, index=option_index(INTAKE_CATEGORIES, draft["category"], len(INTAKE_CATEGORIES) - 1), key=f"dcat_{did}")
+            with col_b:
+                priority = st.selectbox("Priority", priority_choices, index=option_index(priority_choices, draft["priority"], 1), key=f"dpri_{did}")
+            with col_c:
+                dept_options = ["— Select department —"] + DEPARTMENTS
+                suggested_dept = normalize_department(draft["suggested_department"])
+                dept_index = dept_options.index(suggested_dept) if suggested_dept in dept_options else 0
+                department_choice = st.selectbox("Assign to department *", dept_options, index=dept_index, key=f"ddept_{did}")
+                department = "" if department_choice.startswith("—") else department_choice
+            draft_subteams = subteams_for(department)
+            if draft_subteams:
+                current_sub = clean_subteam(department, draft["suggested_subteam"])
+                sub_options = ["— Select sub-team —"] + draft_subteams
+                sub_choice = st.selectbox(
+                    f"{department} sub-team *", sub_options,
+                    index=sub_options.index(current_sub) if current_sub in sub_options else 0, key=f"dsub_{did}",
+                )
+                draft_subteam = "" if sub_choice.startswith("—") else sub_choice
+            else:
+                draft_subteam = ""
+            if draft["requester_name"] or draft["contact"]:
+                st.caption(f"Requester: {draft['requester_name'] or 'Unknown'}  ·  {draft['contact'] or 'no contact'}")
+            if draft["excerpt"]:
+                st.caption("Chat excerpt")
+                st.code(draft["excerpt"])
+            review_note = st.text_input("Note (or reason for rejecting)", key=f"dnote_{did}")
+            may_route = can_manage(department=current_user.department, admin=is_admin_user, ticket_department=department)
+            approve_col, reject_col = st.columns(2)
+            approve = approve_col.button("Approve as support request", type="primary", key=f"dok_{did}", disabled=not may_route)
+            reject = reject_col.button("Reject", key=f"dno_{did}", disabled=not may_route)
+            if not may_route:
+                st.caption("Only the owning department or an admin can approve or reject this draft.")
+
+            if approve:
+                if not department:
+                    st.error("Choose a department before approving.")
+                    st.stop()
+                if not summary.strip():
+                    st.error("Add a summary before approving.")
+                    st.stop()
+                if draft_subteams and not draft_subteam:
+                    st.error(f"Select a {department} sub-team before approving.")
+                    st.stop()
+                ticket_id = str(uuid.uuid4())
+                now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
+                reported_ts = pd.to_datetime(draft["reported_at"], errors="coerce", utc=True) if draft["reported_at"] else pd.NaT
+                reported_value = draft["reported_at"] if (pd.notna(reported_ts) and reported_ts <= pd.Timestamp.now(tz="UTC")) else now_stamp
+                new = {
+                    "Ticket ID": ticket_id, "Support Request Number": support_number,
+                    "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
+                    "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
+                    "Reported At": reported_value, "Requester Type": "External Clients",
+                    "Requester Name": draft["requester_name"] or "", "Channel": "WhatsApp",
+                    "Customer WhatsApp": draft["contact"] or "",
+                    "Assigned Department": department, "Assigned Sub-team": draft_subteam,
+                    "Reporting Department": current_user.department, "Callback Required": "No",
+                }
+                append_ticket(ws, new)
+                append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
+                append_activity(activity_ws, ticket_id, "intake_approved", "Support Request Number", "", support_number, f"Approved from WhatsApp draft by {current_user.username}")
+                draft_store.resolve(did, status="approved", reviewed_by=current_user.username, review_note=review_note.strip(), approved_ticket_id=ticket_id)
+                st.success(f"Approved as {support_number}.")
+                st.rerun()
+            if reject:
+                draft_store.resolve(did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip())
+                st.info("Draft rejected.")
                 st.rerun()
 
 st.divider()

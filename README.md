@@ -54,6 +54,36 @@ When you log a request you assign it to any department, your own or another. The
 
 Legacy requests created before departments existed are routed to IT so nothing is hidden.
 
+## WhatsApp intake
+
+Busy WhatsApp group chats can be mined for genuine issues under **Import from
+WhatsApp**. Export a chat (Chat → Export chat → Without media) and upload the
+`.txt` or the `.zip`. The dashboard shows the chat's date span, you pick a **date
+range** to scan, and it extracts only the messages worth logging as tickets:
+**client complaints, app misbehaviour or bugs, and process/workflow/system
+improvement suggestions**. Routine operational chatter (job approvals, solver
+dispatch, logbook and letter submissions, greetings, acknowledgements, media) is
+deliberately ignored.
+
+Extracted items become **draft requests** under **Pending intake**. Drafts are a
+staging area, so they do not count toward SLA or analytics. A reviewer opens each
+draft, adjusts the summary, category, and priority, chooses the **department**
+(required; a sub-team is required for Operations), then **Approves** it into a
+real support request or **Rejects** it with a note. Approving records the
+reviewer and links the draft to the new ticket. Approved WhatsApp items are
+tagged Channel = WhatsApp and Requester type = External Clients.
+
+Re-uploading overlapping ranges is safe: each extracted item is fingerprinted, so
+messages already turned into drafts are skipped rather than duplicated.
+
+When `OPENAI_API_KEY` is set, the messages are read in batches by a model that
+identifies the genuine issues and suggests category and priority (only ever from
+the dashboard's own lists; the department is left blank for the reviewer). Set
+`OPENAI_MODEL` to choose the model (default `gpt-4o-mini`). Without a key, a
+keyword fallback flags likely issues so the feature still works, at lower
+quality. Pick a modest date range (for example a week) to keep scans fast and
+within API limits.
+
 ### User accounts
 
 Accounts are named users with a hashed password, a department, an optional Operations sub-team, and a role of `member` or `admin`. Seed or update them from a CSV:
@@ -185,7 +215,7 @@ pytest
 
 Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
 
-The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, and the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 53 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store), and the WhatsApp intake pipeline (chat parsing, categorisation fallback, and the draft store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 62 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
 
 ## Branding
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
+import uuid
 
 from datetime import datetime
 
@@ -89,6 +90,33 @@ class User(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[str] = mapped_column(String(40), default="")
     updated_at: Mapped[str] = mapped_column(String(40), default="")
+
+
+class DraftRequest(Base):
+    """A staged support request awaiting human approval (from WhatsApp, etc.)."""
+
+    __tablename__ = "draft_requests"
+
+    draft_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    source: Mapped[str] = mapped_column(String(40), default="whatsapp")
+    source_reference: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), index=True, default="pending")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str | None] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(String(100))
+    priority: Mapped[str | None] = mapped_column(String(30))
+    suggested_department: Mapped[str | None] = mapped_column(String(60))
+    suggested_subteam: Mapped[str | None] = mapped_column(String(60))
+    requester_name: Mapped[str | None] = mapped_column(String(200))
+    contact: Mapped[str | None] = mapped_column(String(60))
+    reported_at: Mapped[str | None] = mapped_column(String(40))
+    excerpt: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40), default="")
+    reviewed_at: Mapped[str | None] = mapped_column(String(40))
+    reviewed_by: Mapped[str | None] = mapped_column(String(200))
+    review_note: Mapped[str | None] = mapped_column(Text)
+    approved_ticket_id: Mapped[str | None] = mapped_column(String(36))
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
 
 
 TICKET_MAP = {
@@ -300,3 +328,81 @@ class UserStore:
 
 def create_user_store(url=None):
     return UserStore(create_session_factory(database_url(url)))
+
+
+_DRAFT_FIELDS = (
+    "draft_id", "source", "source_reference", "status", "summary", "description",
+    "category", "priority", "suggested_department", "suggested_subteam",
+    "requester_name", "contact", "reported_at", "excerpt", "created_at",
+    "reviewed_at", "reviewed_by", "review_note", "approved_ticket_id", "source_fingerprint",
+)
+
+
+def _draft_snapshot(draft):
+    if draft is None:
+        return None
+    return {field: getattr(draft, field) for field in _DRAFT_FIELDS}
+
+
+class DraftStore:
+    """Persistence for staged (pending-approval) support requests."""
+
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def add(self, values):
+        draft_id = values.get("draft_id") or str(uuid.uuid4())
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.session_factory.begin() as session:
+            session.add(DraftRequest(
+                draft_id=draft_id,
+                source=values.get("source", "whatsapp"),
+                source_reference=values.get("source_reference"),
+                status=values.get("status", "pending"),
+                summary=values.get("summary", ""),
+                description=values.get("description"),
+                category=values.get("category"),
+                priority=values.get("priority"),
+                suggested_department=values.get("suggested_department"),
+                suggested_subteam=values.get("suggested_subteam"),
+                requester_name=values.get("requester_name"),
+                contact=values.get("contact"),
+                reported_at=values.get("reported_at"),
+                excerpt=values.get("excerpt"),
+                created_at=values.get("created_at") or now,
+                source_fingerprint=values.get("source_fingerprint"),
+            ))
+        return draft_id
+
+    def fingerprints(self):
+        """All known fingerprints across every status, for de-duplication."""
+        with self.session_factory() as session:
+            rows = session.scalars(select(DraftRequest.source_fingerprint)).all()
+        return {value for value in rows if value}
+
+    def list(self, status="pending"):
+        with self.session_factory() as session:
+            query = select(DraftRequest).order_by(DraftRequest.created_at)
+            if status:
+                query = query.where(DraftRequest.status == status)
+            return [_draft_snapshot(d) for d in session.scalars(query).all()]
+
+    def get(self, draft_id):
+        with self.session_factory() as session:
+            return _draft_snapshot(session.get(DraftRequest, draft_id))
+
+    def resolve(self, draft_id, *, status, reviewed_by="", review_note="", approved_ticket_id=""):
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.session_factory.begin() as session:
+            draft = session.get(DraftRequest, draft_id)
+            if draft is None:
+                raise ValueError("This draft no longer exists.")
+            draft.status = status
+            draft.reviewed_at = now
+            draft.reviewed_by = reviewed_by or None
+            draft.review_note = review_note or None
+            draft.approved_ticket_id = approved_ticket_id or None
+
+
+def create_draft_store(url=None):
+    return DraftStore(create_session_factory(database_url(url)))
