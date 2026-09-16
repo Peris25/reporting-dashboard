@@ -144,22 +144,31 @@ The activity worksheet is created automatically if it does not exist.
 
 Existing worksheets using the original eight ticket columns are extended automatically with the reporting fields. Existing data and column order are preserved. New deployments should use PostgreSQL.
 
-## Render deployment
+## Deployment (Streamlit Community Cloud)
 
-To move off Render completely, follow [Streamlit Community Cloud + Neon setup and data transfer](docs/streamlit-cloud.md).
-The app supports automatic migrations with `AUTO_MIGRATE=true`; use the supplied
-Community Cloud secrets template to require PostgreSQL and preserve durable data.
+The app is hosted on [Streamlit Community Cloud](https://streamlit.io/cloud) and the
+database on managed PostgreSQL (for example [Neon](https://neon.tech/)). The app
+is stateless; all tickets, history, and user accounts live in PostgreSQL, so the
+host and the database are independent.
 
-`render.yaml` defines one Streamlit web service and one Render PostgreSQL database in the same Frankfurt region. Render injects the database's private `connectionString` as `DATABASE_URL`; no database password is committed to the repository.
+1. In Streamlit Community Cloud, create an app from this repository, branch `main`, file `app.py`.
+2. Open the app's **Settings → Secrets** and paste the template from `.streamlit/community-cloud.secrets.toml.example`.
+   Set `DATABASE_URL` to your PostgreSQL connection string (Neon's direct URL, preserving its TLS options).
+   Keep `USE_DATABASE = "true"`, `REQUIRE_POSTGRES = "true"`, and `AUTO_MIGRATE = "true"`.
+3. Deploy. On start, `AUTO_MIGRATE` applies Alembic migrations (creating the `users` table and routing columns), then the app runs.
+4. Seed accounts once the database is reachable: `python scripts/seed_users.py users_seed.csv` (see **Roles and departments**).
 
-1. Push the project to a private GitHub repository.
-2. In Render, create a Blueprint from that repository.
-3. Supply `DASHBOARD_PASSWORD_HASH`, `SUPPORT_EMAIL`, and `SUPPORT_WHATSAPP` when prompted.
-4. Deploy. Render installs dependencies, applies Alembic migrations, and starts Streamlit on the assigned port.
+`AUTO_MIGRATE=true` is additive and safe on an existing database: it adds the new
+columns and the `users` table and tags pre-existing requests as IT, without
+rewriting or deleting ticket data.
 
-For the existing service, pushes go to `main` in `Parkire-Solvit/reporting-dashboard`. If that is the service's linked branch and auto-deploy is enabled, a push triggers deployment. Check the service's Events page for the intended commit and a successful deployment before expecting changes on the live dashboard.
+### Migrating existing data off Render
 
-The database blocks public inbound connections in the Blueprint. Render's web service connects over its private network.
+If you are moving an existing Render-hosted database to Neon, follow
+[Streamlit Community Cloud + Neon setup and data transfer](docs/streamlit-cloud.md).
+The transfer tool copies `tickets` and `ticket_activity` and preserves IDs and all
+timestamps; re-run `scripts/seed_users.py` against the new database afterwards to
+recreate accounts. Keep the old database until you have verified the copy.
 
 ## Jira import
 
@@ -176,7 +185,7 @@ pytest
 
 Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
 
-The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, and the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 52 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, and the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 53 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
 
 ## Branding
 
