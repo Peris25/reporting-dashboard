@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 .env
+Jira.csv
+*.db
+.pytest_cache/
+.venv/
+.test-tmp/
+# Real user seed lists contain names and temporary passwords. Keep only the example.
+users_seed.csv
