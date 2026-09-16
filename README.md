@@ -35,6 +35,38 @@ Solvit's internal support dashboard, built with Streamlit and PostgreSQL. It tra
 
 Existing Solver IDs remain stored separately for compatibility; they are not reinterpreted as vehicle registrations. The registration migration adds a new `reg_no` column. Google Sheets appends the new header without shifting existing data.
 
+## Roles and departments
+
+The dashboard supports multiple departments with named user accounts. The departments are **IT, HR, Operations, and BD**. Operations is split into three sub-teams, **Scheduling, Approval, and Solver (Submissions)**, which are tagged on each request and used for filtering rather than for separate logins. The same SLA targets apply to every department.
+
+Each request carries three routing fields on top of the existing "Who needs support?" requester type, which is a separate question about who reported the issue.
+
+- **Assigned Department** is the department responsible for resolving the request. Operations requests also carry an **Assigned Sub-team**.
+- **Reporting Department** is recorded automatically from the signed-in user's department.
+
+When you log a request you assign it to any department, your own or another. The owning department then sees it.
+
+### What each role sees and can do
+
+- **A department member** sees requests their department owns plus requests their department raised, so both work sent to them and work they raised are visible. They can create requests, and edit, progress, close, or reassign only the requests their department owns. On requests owned by another department they have view-only access and can add a note.
+- **IT is the global-view department.** IT accounts (and any account with the `admin` role) see every request across the company. A **Department** filter in the sidebar scopes the whole dashboard, including KPIs, charts, exports, and the weekly comparison, to one department. A **Company-wide by department** table shows open, needs-attention, breach percentages, and average closure TAT for each department and Operations sub-team, so the weakest links are visible at a glance.
+- **Deletion** is restricted to admins.
+
+Legacy requests created before departments existed are routed to IT so nothing is hidden.
+
+### User accounts
+
+Accounts are named users with a hashed password, a department, an optional Operations sub-team, and a role of `member` or `admin`. Seed or update them from a CSV:
+
+```bash
+cp users_seed.example.csv users_seed.csv   # then edit with your real users
+python scripts/seed_users.py users_seed.csv
+```
+
+The CSV columns are `username, display_name, department, subteam, role, temp_password`. Leave `temp_password` blank to have one generated and printed once. Every seeded account must change its password on first login. Passwords are stored only as salted PBKDF2 hashes, and `users_seed.csv` is git-ignored because it holds names and temporary passwords.
+
+Login is required only once auth is configured, meaning at least one account exists or a bootstrap admin is set. Set `DASHBOARD_ADMIN_USER` and `DASHBOARD_ADMIN_PASSWORD` for a bootstrap admin that can sign in before any accounts are seeded and recover access if every account is locked out; it always has the IT global view. Run `alembic upgrade head` (or deploy with `AUTO_MIGRATE=true`) so the `users` table and the routing columns are created. The Google Sheets fallback keeps the earlier shared-password gate and treats its single user as an IT admin.
+
 ## SLA and turnaround time
 
 | Milestone | Target from reporting | Recorded timestamp |
@@ -144,7 +176,7 @@ pytest
 
 Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
 
-The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, and preservation of legacy Solver IDs during migration. App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 31 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, and the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 52 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
 
 ## Branding
 

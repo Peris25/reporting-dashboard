@@ -1,0 +1,7 @@
+username,display_name,department,subteam,role,temp_password
+alice,Alice IT Lead,IT,,admin,
+brian,Brian HR,HR,,member,
+carol,Carol Ops Scheduling,Operations,Scheduling,member,
+dan,Dan Ops Approval,Operations,Approval,member,
+esther,Esther Ops Submissions,Operations,Solver (Submissions),member,
+frank,Frank BD,BD,,member,

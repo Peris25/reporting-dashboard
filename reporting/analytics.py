@@ -4,8 +4,10 @@ import pandas as pd
 
 from reporting.sla import (
     RESPONSE_SLA_HOURS, DIAGNOSIS_SLA_HOURS, CLOSURE_SLA_HOURS,
-    classify_sla, elapsed_hours, format_duration, parse_datetime, reported_time,
+    breach_rate, classify_sla, elapsed_hours, format_duration, overdue_milestones,
+    parse_datetime, reported_time,
 )
+from reporting.departments import ALL_DEPARTMENTS_OPTION, ALL_SUBTEAMS_OPTION, subteams_for
 
 MILESTONES = [
     ("Response", "First Response At", RESPONSE_SLA_HOURS),
@@ -15,7 +17,8 @@ MILESTONES = [
 
 
 def filter_requests(df, status="All statuses", priority="All priorities", month="All months",
-                    owner="All agents", search=""):
+                    owner="All agents", search="", department=ALL_DEPARTMENTS_OPTION,
+                    subteam=ALL_SUBTEAMS_OPTION):
     view = df.copy()
     for field, value, all_value in [
         ("Status", status, "All statuses"), ("Priority", priority, "All priorities"),
@@ -23,15 +26,73 @@ def filter_requests(df, status="All statuses", priority="All priorities", month=
     ]:
         if value != all_value:
             view = view.loc[view[field].eq(value)]
+    if department != ALL_DEPARTMENTS_OPTION:
+        assigned = view.get("Assigned Department", "").fillna("").astype(str).str.strip()
+        view = view.loc[assigned.eq(department)]
+    if subteam != ALL_SUBTEAMS_OPTION:
+        sub = view.get("Assigned Sub-team", "").fillna("").astype(str).str.strip()
+        view = view.loc[sub.eq(subteam)]
     owners = view["Assignee"].fillna("").astype(str).str.strip()
     if owner != "All agents":
         view = view.loc[owners.eq("" if owner == "Unassigned" else owner)]
     if search.strip():
-        fields = ["Ticket ID", "Support Request Number", "Reg No", "Job Request ID", "Requester Name", "Summary", "Status", "Priority", "Assignee"]
-        searchable = view[fields].fillna("").astype(str)
+        fields = ["Ticket ID", "Support Request Number", "Reg No", "Job Request ID", "Requester Name", "Summary", "Status", "Priority", "Assignee", "Assigned Department", "Reporting Department"]
+        present = [field for field in fields if field in view.columns]
+        searchable = view[present].fillna("").astype(str)
         matches = searchable.apply(lambda col: col.str.lower().str.contains(search.strip().lower(), regex=False))
         view = view.loc[matches.any(axis=1)]
     return view.sort_values("Created_dt", ascending=True, na_position="last")
+
+
+def _breakdown_row(label, group):
+    open_mask = group["Status"].ne("closed")
+    open_requests = group.loc[open_mask]
+    overdue = overdue_milestones(open_requests).any(axis=1) if len(open_requests) else pd.Series(dtype=bool)
+    unassigned = open_requests["Assignee"].fillna("").astype(str).str.strip().eq("") if len(open_requests) else pd.Series(dtype=bool)
+    needs_attention = int((overdue | unassigned).sum()) if len(open_requests) else 0
+    closed = group.loc[group["Status"].eq("closed")]
+    return {
+        "Scope": label,
+        "Total": int(len(group)),
+        "Open": int(open_mask.sum()),
+        "Needs attention": needs_attention,
+        "Closed": int(len(closed)),
+        "Response breach %": breach_rate(group["Response SLA"]),
+        "Diagnosis breach %": breach_rate(group["Diagnosis SLA"]),
+        "Closure breach %": breach_rate(group["Closure SLA"]),
+        "Avg closure TAT": format_duration(closed["Closure Hours"].mean()) if len(closed) else "—",
+    }
+
+
+def department_breakdown(df, departments):
+    """A per-department (and Operations sub-team) health table for admins.
+
+    This intentionally ignores the in-page status/priority/agent filters so the
+    company-wide picture stays comparable across departments.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Scope", "Total", "Open", "Needs attention", "Closed",
+            "Response breach %", "Diagnosis breach %", "Closure breach %", "Avg closure TAT",
+        ])
+    assigned = df.get("Assigned Department", "").fillna("").astype(str).str.strip()
+    rows = []
+    for department in departments:
+        group = df.loc[assigned.eq(department)]
+        if group.empty:
+            continue
+        rows.append(_breakdown_row(department, group))
+        subs = subteams_for(department)
+        if subs:
+            sub_series = group.get("Assigned Sub-team", "").fillna("").astype(str).str.strip()
+            for subteam in subs:
+                sub_group = group.loc[sub_series.eq(subteam)]
+                if not sub_group.empty:
+                    rows.append(_breakdown_row(f"   {department} · {subteam}", sub_group))
+    unrouted = df.loc[~assigned.isin(departments)]
+    if not unrouted.empty:
+        rows.append(_breakdown_row("Unrouted", unrouted))
+    return pd.DataFrame(rows)
 
 
 def remaining_time(hours):

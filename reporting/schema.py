@@ -40,6 +40,9 @@ EXTENDED_HEADERS = [
     "Resolution Summary",
     "Reg No",
     "Reported At",
+    "Assigned Department",
+    "Assigned Sub-team",
+    "Reporting Department",
 ]
 
 TICKET_HEADERS = CORE_HEADERS + EXTENDED_HEADERS

@@ -12,12 +12,19 @@ import os
 from reporting.jira import import_summary, normalize_jira_csv
 from reporting.schema import ACTIVITY_HEADERS, STATUSES, TICKET_HEADERS
 from reporting.sla import enrich_tickets, format_duration, overdue_milestones, reported_time
-from reporting.views import render_reporting_views, render_weekly_report
+from reporting.views import render_department_breakdown, render_reporting_views, render_weekly_report
 from reporting.analytics import filter_requests, milestone_deadlines
 from reporting.workflow import can_transition
 from reporting.history import request_history
-from reporting.database import database_handles
+from reporting.database import create_user_store, database_handles
 from reporting.bootstrap import initialize_database
+from reporting.access import (
+    CurrentUser, can_delete, can_manage, clean_subteam, hash_password, verify_password, visible_tickets,
+)
+from reporting.departments import (
+    ALL_DEPARTMENTS_OPTION, ALL_SUBTEAMS_OPTION, DEPARTMENTS, GLOBAL_VIEW_DEPARTMENT,
+    normalize_department, subteams_for,
+)
 from sqlalchemy.engine import make_url
 from reporting.theme import apply_solvit_theme, render_brand_header, render_dashboard_hero, render_kpi_cards, render_login_header, render_sidebar_footer, render_sidebar_header
 
@@ -45,6 +52,11 @@ ACTIVITY_WORKSHEET_NAME = setting("ACTIVITY_WORKSHEET_NAME", "ticket_activity_lo
 SUPPORT_EMAIL = setting("SUPPORT_EMAIL")
 SUPPORT_WHATSAPP = str(setting("SUPPORT_WHATSAPP")).replace("+", "").replace(" ", "")
 DASHBOARD_PASSWORD_HASH = setting("DASHBOARD_PASSWORD_HASH")
+# A bootstrap admin lets someone sign in before any accounts are seeded, and
+# recover access if every account is ever locked out. It always has the IT
+# global view.
+BOOTSTRAP_ADMIN_USER = str(setting("DASHBOARD_ADMIN_USER")).strip()
+BOOTSTRAP_ADMIN_PASSWORD = setting("DASHBOARD_ADMIN_PASSWORD")
 
 REQUIRED_HEADERS = TICKET_HEADERS
 
@@ -239,16 +251,129 @@ def require_login():
     st.stop()
 
 
+@st.cache_resource
+def get_user_store():
+    configured_url = setting("DATABASE_URL")
+    return create_user_store(configured_url or None)
+
+
+def current_user_from(account):
+    return CurrentUser(
+        username=account["username"], display_name=account["display_name"],
+        department=account["department"], subteam=account.get("subteam", ""),
+        role=account.get("role", "member"),
+    )
+
+
+def authenticate(user_store, username, password):
+    """Return an account dict for valid credentials, otherwise None."""
+    username = str(username or "").strip()
+    if not username or not password:
+        return None
+    if BOOTSTRAP_ADMIN_USER and username.lower() == BOOTSTRAP_ADMIN_USER.lower():
+        if BOOTSTRAP_ADMIN_PASSWORD and hmac.compare_digest(str(password), str(BOOTSTRAP_ADMIN_PASSWORD)):
+            return {"username": username.lower(), "display_name": "Administrator",
+                    "department": GLOBAL_VIEW_DEPARTMENT, "subteam": "", "role": "admin",
+                    "must_change_password": False}
+        return None
+    account = user_store.get(username)
+    if account is None or not account.active or not verify_password(password, account.password_hash):
+        return None
+    return {"username": account.username, "display_name": account.display_name,
+            "department": account.department, "subteam": account.subteam or "",
+            "role": account.role, "must_change_password": account.must_change_password}
+
+
+def render_force_password_change(user_store):
+    render_login_header()
+    st.warning("Your temporary password must be changed before you can continue.")
+    left, center, right = st.columns([1, 1.15, 1])
+    with center, st.form("force_password_change"):
+        new_password = st.text_input("New password", type="password", placeholder="At least 8 characters")
+        confirm_password = st.text_input("Confirm new password", type="password")
+        submitted = st.form_submit_button("Set new password", type="primary", width="stretch")
+    if submitted:
+        if len(new_password) < 8:
+            st.error("Use at least 8 characters.")
+        elif new_password != confirm_password:
+            st.error("The two passwords do not match.")
+        else:
+            user_store.set_password(st.session_state["account"]["username"], hash_password(new_password),
+                                    must_change_password=False)
+            st.session_state["account"]["must_change_password"] = False
+            st.success("Password updated.")
+            st.rerun()
+
+
+def require_account_login(user_store):
+    """Named-account login with a forced reset for temporary passwords."""
+    if st.session_state.get("authenticated") and st.session_state.get("account"):
+        if st.session_state["account"].get("must_change_password"):
+            render_force_password_change(user_store)
+            st.stop()
+        return current_user_from(st.session_state["account"])
+    render_login_header()
+    if not BOOTSTRAP_ADMIN_USER and user_store.count() == 0:
+        st.warning(
+            "No accounts exist yet. Seed users with scripts/seed_users.py, or set "
+            "DASHBOARD_ADMIN_USER and DASHBOARD_ADMIN_PASSWORD for a bootstrap admin."
+        )
+    left, center, right = st.columns([1, 1.15, 1])
+    with center, st.form("account_login_form"):
+        username = st.text_input("Username", placeholder="Your username")
+        password = st.text_input("Password", type="password", placeholder="Your password")
+        submitted = st.form_submit_button("Sign in to dashboard", type="primary", width="stretch")
+    if submitted:
+        account = authenticate(user_store, username, password)
+        if account is None:
+            st.error("Incorrect username or password, or the account is inactive.")
+            st.stop()
+        st.session_state["authenticated"] = True
+        st.session_state["account"] = account
+        st.session_state["user"] = account["username"]
+        st.rerun()
+    st.stop()
+
+
+def normalize_department_columns(frame):
+    """Route legacy or blank requests to the IT global view so nothing is hidden."""
+    frame["Assigned Department"] = (
+        frame.get("Assigned Department", "").fillna("").astype(str).str.strip().replace("", GLOBAL_VIEW_DEPARTMENT)
+    )
+    frame["Assigned Sub-team"] = frame.get("Assigned Sub-team", "").fillna("").astype(str).str.strip()
+    frame["Reporting Department"] = frame.get("Reporting Department", "").fillna("").astype(str).str.strip()
+    return frame
+
+
 # ---- App ----
-require_login()
+ws, activity_ws = get_sheet_handles()
+ensure_headers(ws, REQUIRED_HEADERS)
+ensure_headers(activity_ws, ACTIVITY_HEADERS)
+
+OPEN_ADMIN = CurrentUser(username="dashboard-user", display_name="Dashboard user",
+                         department=GLOBAL_VIEW_DEPARTMENT, role="admin")
+
+if USE_DATABASE:
+    user_store = get_user_store()
+    # Require named-account login only once auth is set up (accounts seeded or a
+    # bootstrap admin configured). Until then the tool stays open as an IT admin,
+    # matching its pre-roles default so existing deployments are never locked out.
+    if bool(BOOTSTRAP_ADMIN_USER) or user_store.count() > 0:
+        current_user = require_account_login(user_store)
+    else:
+        current_user = OPEN_ADMIN
+else:
+    # Google Sheets fallback keeps the legacy shared-password gate and treats the
+    # single user as an IT admin, matching the tool's pre-roles behaviour.
+    require_login()
+    current_user = OPEN_ADMIN
+
+is_admin_user = current_user.is_admin
+
 render_brand_header()
 render_dashboard_hero()
 
 render_sidebar_header()
-
-ws, activity_ws = get_sheet_handles()
-ensure_headers(ws, REQUIRED_HEADERS)
-ensure_headers(activity_ws, ACTIVITY_HEADERS)
 
 df = read_df(ws, REQUIRED_HEADERS)
 activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
@@ -262,26 +387,52 @@ df["Diagnosed At"] = df["Diagnosed At"].astype(str).str.strip()
 df["Resolved At"] = df["Resolved At"].astype(str).str.strip()
 df["Updated At"] = df["Updated At"].astype(str).str.strip()
 
-df = enrich_tickets(df, DIAGNOSIS_SLA_HOURS, RESOLUTION_SLA_HOURS)
+df = normalize_department_columns(enrich_tickets(df, DIAGNOSIS_SLA_HOURS, RESOLUTION_SLA_HOURS))
 
-# ---- Sidebar filters ----
+# Scope every request to what this user may see before any in-page filtering.
+scoped_df = visible_tickets(df, department=current_user.department, admin=is_admin_user)
+
+# ---- Sidebar identity + filters ----
+st.sidebar.caption(
+    f"Signed in as **{current_user.display_name}**"
+    f"  ·  {current_user.department}"
+    + (f" ({current_user.subteam})" if current_user.subteam else "")
+    + ("  ·  Admin (all departments)" if is_admin_user else "")
+)
+
+# Admins can scope the whole dashboard to one department; members are already
+# scoped to their own department, so this filter is hidden for them.
+if is_admin_user:
+    department_filter = st.sidebar.selectbox("Department", [ALL_DEPARTMENTS_OPTION] + DEPARTMENTS)
+else:
+    department_filter = ALL_DEPARTMENTS_OPTION
+
+# The sub-team filter appears when the department in view has sub-teams.
+effective_department = department_filter if is_admin_user else current_user.department
+subteam_options = subteams_for(effective_department) if effective_department != ALL_DEPARTMENTS_OPTION else []
+if subteam_options:
+    subteam_filter = st.sidebar.selectbox("Operations sub-team", [ALL_SUBTEAMS_OPTION] + subteam_options)
+else:
+    subteam_filter = ALL_SUBTEAMS_OPTION
+
 status_filter = st.sidebar.selectbox("Request status", ["All statuses"] + STATUSES)
 
-priorities = sorted([p for p in df["Priority"].dropna().unique() if str(p).strip() != ""])
+priorities = sorted([p for p in scoped_df["Priority"].dropna().unique() if str(p).strip() != ""])
 priority_filter = st.sidebar.selectbox("Priority", ["All priorities"] + priorities) if priorities else "All priorities"
 
-months = sorted([m for m in df["Created Month"].dropna().unique() if m != "NaT"])
+months = sorted([m for m in scoped_df["Created Month"].dropna().unique() if m != "NaT"])
 month_filter = st.sidebar.selectbox("Created month", ["All months"] + months) if months else "All months"
-agents = sorted({str(value).strip() for value in df["Assignee"].fillna("") if str(value).strip()})
+agents = sorted({str(value).strip() for value in scoped_df["Assignee"].fillna("") if str(value).strip()})
 owner_filter = st.sidebar.selectbox("Assigned agent", ["All agents", "Unassigned"] + agents)
 
 render_sidebar_footer()
-if DASHBOARD_PASSWORD_HASH and st.sidebar.button("Sign out", icon=":material/logout:", key="sidebar_logout"):
-    st.session_state.pop("authenticated", None)
+if st.sidebar.button("Sign out", icon=":material/logout:", key="sidebar_logout"):
+    for key in ["authenticated", "account", "user"]:
+        st.session_state.pop(key, None)
     st.rerun()
 
-search = st.text_input("Search support requests", placeholder="Support number, Reg No, Job Request ID, requester, summary, or agent")
-view = filter_requests(df, status_filter, priority_filter, month_filter, owner_filter, search)
+search = st.text_input("Search support requests", placeholder="Support number, Reg No, Job Request ID, requester, summary, department, or agent")
+view = filter_requests(scoped_df, status_filter, priority_filter, month_filter, owner_filter, search, department_filter, subteam_filter)
 
 @st.fragment(run_every="10m")
 def render_live_reporting():
@@ -291,8 +442,11 @@ def render_live_reporting():
     for field in ["Status", "Summary", "Priority", "Assignee"]:
         fresh[field] = fresh[field].fillna("").astype(str).str.strip()
     fresh["Status"] = fresh["Status"].str.lower()
-    live_df = enrich_tickets(fresh, now=refreshed_at)
-    live_view = filter_requests(live_df, status_filter, priority_filter, month_filter, owner_filter, search)
+    live_df = normalize_department_columns(enrich_tickets(fresh, now=refreshed_at))
+    live_role = visible_tickets(live_df, department=current_user.department, admin=is_admin_user)
+    live_view = filter_requests(live_role, status_filter, priority_filter, month_filter, owner_filter, search, department_filter, subteam_filter)
+    # The weekly comparison ignores the in-page filters but keeps the department scope.
+    weekly_scope = filter_requests(live_role, department=department_filter, subteam=subteam_filter)
     st.caption(f"Analytics refresh every 10 minutes. Last updated {refreshed_at.tz_convert('Africa/Nairobi'):%H:%M:%S} Nairobi time.")
     # ---- Summary metrics ----
     closed_requests = live_view["Status"].eq("closed")
@@ -345,7 +499,11 @@ def render_live_reporting():
     render_reporting_views(live_view)
     st.divider()
 
-    render_weekly_report(live_df, refreshed_at)
+    if is_admin_user:
+        render_department_breakdown(live_role)
+        st.divider()
+
+    render_weekly_report(weekly_scope, refreshed_at)
 
 render_live_reporting()
 
@@ -397,6 +555,10 @@ requester_type = st.segmented_control(
 channel = st.segmented_control(
     "How did they reach out?", ["Call", "WhatsApp", "SMS", "Email", "Other"], default="Call", key="intake_channel"
 )
+default_department = current_user.department if current_user.department in DEPARTMENTS else DEPARTMENTS[0]
+assign_department = st.segmented_control(
+    "Assign to department", DEPARTMENTS, default=default_department, key="intake_assign_department"
+) or default_department
 
 with st.form("quick_support_intake", clear_on_submit=True):
     reported_at = st.datetime_input(
@@ -420,6 +582,16 @@ with st.form("quick_support_intake", clear_on_submit=True):
         phone = st.text_input("Phone / WhatsApp number", placeholder="e.g. 2547XXXXXXXX")
         received_by = st.text_input("Received by *", placeholder="Solvit team member")
         assigned_to = st.text_input("Assigned support agent", placeholder="Leave blank if not assigned")
+
+    if subteams_for(assign_department):
+        assign_subteam = st.selectbox(f"{assign_department} sub-team *", subteams_for(assign_department), key="intake_subteam")
+    else:
+        assign_subteam = ""
+    st.caption(
+        f"Routing to **{assign_department}**"
+        + (f" · {assign_subteam}" if assign_subteam else "")
+        + f".  Reporting department: **{current_user.department}** (recorded automatically)."
+    )
 
     issue_left, issue_right = st.columns([1.45, 1])
     with issue_left:
@@ -453,6 +625,8 @@ with st.form("quick_support_intake", clear_on_submit=True):
         if not received_by.strip(): errors.append("Received by is required.")
         if not summary.strip(): errors.append("Issue summary is required.")
         if callback_required and not callback_deadline: errors.append("Set a callback deadline when a callback is required.")
+        if subteams_for(assign_department) and not assign_subteam:
+            errors.append(f"Select a {assign_department} sub-team.")
         if errors:
             for error in errors: st.error(error)
         else:
@@ -470,10 +644,15 @@ with st.form("quick_support_intake", clear_on_submit=True):
                 "Channel": channel, "Customer WhatsApp": phone.strip(), "Received By": received_by.strip(),
                 "Assignee": assigned_to.strip(), "Call Outcome": call_outcome,
                 "Callback Required": "Yes" if callback_required else "No", "Callback Deadline": callback_deadline,
+                "Assigned Department": assign_department,
+                "Assigned Sub-team": assign_subteam,
+                "Reporting Department": current_user.department,
             }
             append_ticket(ws, new)
             append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
             append_activity(activity_ws, ticket_id, "intake_recorded", "Support Request Number", "", support_number, f"{requester_type} via {channel}")
+            routed_to = assign_department + (f" / {assign_subteam}" if assign_subteam else "")
+            append_activity(activity_ws, ticket_id, "routed", "Assigned Department", "", routed_to, f"Reported by {current_user.department}")
             st.success(f"Created {support_number}.")
             st.rerun()
 
@@ -507,6 +686,16 @@ else:
         f"  •  Job ID: {normalize_text(selected['Job Request ID']) or 'Not applicable'}"
         f"  •  Reg No: {normalize_text(selected['Reg No']) or 'Not recorded'}"
     )
+    st.caption(
+        f"Owned by **{normalize_text(selected['Assigned Department']) or 'Unassigned department'}**"
+        + (f" · {normalize_text(selected['Assigned Sub-team'])}" if normalize_text(selected["Assigned Sub-team"]) else "")
+        + f"  •  Reported by {normalize_text(selected['Reporting Department']) or 'Unknown'}"
+    )
+    can_manage_selected = can_manage(
+        department=current_user.department, admin=is_admin_user, ticket_department=selected["Assigned Department"]
+    )
+    if not can_manage_selected:
+        st.info("This request is owned by another department. You have view-only access and can add a note below.")
 
     with st.form("save_edits_form"):
         corrected_reported_at = st.datetime_input(
@@ -544,6 +733,25 @@ else:
                 value=bool(normalize_text(selected["Callback Completed At"])),
             )
 
+        route_left, route_right = st.columns(2)
+        with route_left:
+            dept_value = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+            new_department = st.selectbox(
+                "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(dept_value),
+                help="Reassign this request to another department. Save to apply.",
+            )
+        with route_right:
+            route_subteams = subteams_for(new_department)
+            if route_subteams:
+                current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
+                new_subteam = st.selectbox(
+                    "Sub-team", route_subteams,
+                    index=route_subteams.index(current_subteam) if current_subteam in route_subteams else 0,
+                )
+            else:
+                new_subteam = ""
+                st.caption("This department has no sub-teams.")
+
         resolution_summary = st.text_area(
             "Resolution summary",
             value=normalize_text(selected["Resolution Summary"]),
@@ -556,7 +764,8 @@ else:
                 "First response sent at", value=nairobi_input_value(selected["First Response At"]),
             )
             mark_responded = st.form_submit_button(
-                "Mark responded", disabled=bool(normalize_text(selected["First Response At"])) or selected["Status"] == "closed",
+                "Mark responded",
+                disabled=bool(normalize_text(selected["First Response At"])) or selected["Status"] == "closed" or not can_manage_selected,
                 help="Record the first response as now and save the current form edits. Use only after responding to the requester.",
             )
         with diagnosis_column:
@@ -564,14 +773,18 @@ else:
                 "Problem diagnosed at", value=nairobi_input_value(selected["Diagnosed At"]),
             )
             mark_diagnosed = st.form_submit_button(
-                "Mark diagnosed", disabled=bool(normalize_text(selected["Diagnosed At"])) or selected["Status"] == "closed",
+                "Mark diagnosed",
+                disabled=bool(normalize_text(selected["Diagnosed At"])) or selected["Status"] == "closed" or not can_manage_selected,
                 help="Record diagnosis as now and save the current form edits. A To do request moves to Diagnosed.",
             )
         st.caption("Milestone buttons record the time now and save your form edits. Use the date fields to correct earlier times.")
         update_note = st.text_area("Update note", placeholder="Add context for this change")
-        save_edits = st.form_submit_button("Save request update", type="primary")
+        save_edits = st.form_submit_button("Save request update", type="primary", disabled=not can_manage_selected)
 
     if save_edits or mark_responded or mark_diagnosed:
+        if not can_manage_selected:
+            st.error("You do not have permission to edit this request.")
+            st.stop()
         base = read_df(ws, REQUIRED_HEADERS)
         base = pd.DataFrame(base)
         for col in REQUIRED_HEADERS:
@@ -588,6 +801,9 @@ else:
             st.error("This request no longer exists. Refresh to select another request.")
             st.stop()
         current = {col: normalize_text(base_idx.loc[tid, col]) for col in REQUIRED_HEADERS}
+        # Treat a legacy blank department as its normalized default so simply
+        # opening and saving a request does not log a phantom routing change.
+        current["Assigned Department"] = normalize_department(current["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
         proposed = current.copy()
         if corrected_reported_at != nairobi_input_value(reported_time(selected)):
             if corrected_reported_at is None:
@@ -608,6 +824,8 @@ else:
                 current["Callback Completed At"] or datetime.now().astimezone().isoformat(timespec="seconds")
             ) if callback_done else "",
             "Resolution Summary": resolution_summary.strip(),
+            "Assigned Department": new_department,
+            "Assigned Sub-team": clean_subteam(new_department, new_subteam),
         })
         current["Status"] = current["Status"].lower()
         now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -684,40 +902,50 @@ else:
         st.success("Support request updated.")
         st.rerun()
 
+    if not can_manage_selected:
+        with st.form("viewer_note_form", clear_on_submit=True):
+            viewer_note = st.text_area("Add a note", placeholder="Add context or a question for the owning department")
+            note_submitted = st.form_submit_button("Add note")
+        if note_submitted and viewer_note.strip():
+            append_activity(activity_ws, selected_ticket_id, "note_added", "Note", "", "", viewer_note.strip())
+            st.success("Note added.")
+            st.rerun()
+
 st.divider()
 
-colA, colB = st.columns([1, 1])
-with colA:
-    delete_ids = st.multiselect(
-        "Delete tickets (select by Summary)",
-        options=editor_df["Ticket ID"].tolist(),
-        format_func=lambda tid: editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].values[0],
-    )
-with colB:
-    delete_note = st.text_input("Delete note (optional)", placeholder="Why is this ticket being deleted?")
-
-if st.button("Delete selected"):
-    if not delete_ids:
-        st.warning("Select at least one ticket to delete.")
-        st.stop()
-    base = read_df(ws, REQUIRED_HEADERS)
-    base = pd.DataFrame(base)
-    doomed = base[base["Ticket ID"].isin(delete_ids)].copy()
-    for _, row in doomed.iterrows():
-        append_activity(
-            activity_ws,
-            ticket_id=row["Ticket ID"],
-            action="ticket_deleted",
-            field="Status",
-            old_value=row.get("Status", ""),
-            new_value="",
-            note=delete_note.strip(),
+if can_delete(admin=is_admin_user):
+    colA, colB = st.columns([1, 1])
+    with colA:
+        delete_ids = st.multiselect(
+            "Delete tickets (select by Summary)",
+            options=editor_df["Ticket ID"].tolist(),
+            format_func=lambda tid: editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].values[0],
         )
-    delete_tickets(ws, delete_ids)
-    st.success(f"Deleted {len(delete_ids)} ticket(s).")
-    st.rerun()
+    with colB:
+        delete_note = st.text_input("Delete note (optional)", placeholder="Why is this ticket being deleted?")
 
-st.divider()
+    if st.button("Delete selected"):
+        if not delete_ids:
+            st.warning("Select at least one ticket to delete.")
+            st.stop()
+        base = read_df(ws, REQUIRED_HEADERS)
+        base = pd.DataFrame(base)
+        doomed = base[base["Ticket ID"].isin(delete_ids)].copy()
+        for _, row in doomed.iterrows():
+            append_activity(
+                activity_ws,
+                ticket_id=row["Ticket ID"],
+                action="ticket_deleted",
+                field="Status",
+                old_value=row.get("Status", ""),
+                new_value="",
+                note=delete_note.strip(),
+            )
+        delete_tickets(ws, delete_ids)
+        st.success(f"Deleted {len(delete_ids)} ticket(s).")
+        st.rerun()
+
+    st.divider()
 
 # ---- Activity log ----
 st.subheader("History for this request")

@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import os
 import re
 
-from sqlalchemy import DateTime, Integer, String, Text, create_engine, select
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .schema import ACTIVITY_HEADERS, TICKET_HEADERS
@@ -55,6 +57,9 @@ class Ticket(Base):
     callback_deadline: Mapped[str | None] = mapped_column(String(40))
     callback_completed_at: Mapped[str | None] = mapped_column(String(40))
     resolution_summary: Mapped[str | None] = mapped_column(Text)
+    assigned_department: Mapped[str | None] = mapped_column(String(60), index=True)
+    assigned_subteam: Mapped[str | None] = mapped_column(String(60), index=True)
+    reporting_department: Mapped[str | None] = mapped_column(String(60), index=True)
 
 
 class Activity(Base):
@@ -69,6 +74,21 @@ class Activity(Base):
     note: Mapped[str | None] = mapped_column(Text)
     timestamp: Mapped[str] = mapped_column(String(40), index=True)
     actor: Mapped[str | None] = mapped_column(String(200))
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    username: Mapped[str] = mapped_column(String(120), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(200))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    department: Mapped[str] = mapped_column(String(60), index=True)
+    subteam: Mapped[str | None] = mapped_column(String(60))
+    role: Mapped[str] = mapped_column(String(20), default="member")
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[str] = mapped_column(String(40), default="")
+    updated_at: Mapped[str] = mapped_column(String(40), default="")
 
 
 TICKET_MAP = {
@@ -88,6 +108,9 @@ TICKET_MAP = {
     "Callback Completed At": "callback_completed_at", "Resolution Summary": "resolution_summary",
     "Reg No": "reg_no",
     "Reported At": "reported_at",
+    "Assigned Department": "assigned_department",
+    "Assigned Sub-team": "assigned_subteam",
+    "Reporting Department": "reporting_department",
 }
 ACTIVITY_MAP = {
     "Activity ID": "activity_id", "Ticket ID": "ticket_id", "Action": "action", "Field": "field",
@@ -192,3 +215,88 @@ def database_handles(url=None):
         DatabaseWorksheet(factory, Ticket, TICKET_HEADERS, TICKET_MAP),
         DatabaseWorksheet(factory, Activity, ACTIVITY_HEADERS, ACTIVITY_MAP),
     )
+
+
+@dataclass
+class UserAccount:
+    """A detached, read-only snapshot of a user row for use outside a session."""
+
+    username: str
+    display_name: str
+    password_hash: str
+    department: str
+    subteam: str
+    role: str
+    must_change_password: bool
+    active: bool
+
+
+def _snapshot(user):
+    if user is None:
+        return None
+    return UserAccount(
+        username=user.username,
+        display_name=user.display_name,
+        password_hash=user.password_hash,
+        department=user.department,
+        subteam=user.subteam or "",
+        role=user.role or "member",
+        must_change_password=bool(user.must_change_password),
+        active=bool(user.active),
+    )
+
+
+class UserStore:
+    """Account persistence kept separate from the ticket/activity worksheets."""
+
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    @staticmethod
+    def normalize_username(username):
+        return str(username or "").strip().lower()
+
+    def get(self, username):
+        with self.session_factory() as session:
+            return _snapshot(session.get(User, self.normalize_username(username)))
+
+    def list(self):
+        with self.session_factory() as session:
+            return [_snapshot(user) for user in session.scalars(select(User).order_by(User.username)).all()]
+
+    def count(self):
+        with self.session_factory() as session:
+            return len(list(session.scalars(select(User.username)).all()))
+
+    def upsert(self, *, username, display_name, password_hash, department, subteam="",
+               role="member", must_change_password=True, active=True):
+        key = self.normalize_username(username)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.session_factory.begin() as session:
+            user = session.get(User, key)
+            if user is None:
+                user = User(username=key, created_at=now)
+                session.add(user)
+            user.display_name = display_name
+            user.password_hash = password_hash
+            user.department = department
+            user.subteam = subteam or None
+            user.role = role or "member"
+            user.must_change_password = bool(must_change_password)
+            user.active = bool(active)
+            user.updated_at = now
+        return key
+
+    def set_password(self, username, password_hash, *, must_change_password=False):
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.session_factory.begin() as session:
+            user = session.get(User, self.normalize_username(username))
+            if user is None:
+                raise ValueError("This account no longer exists.")
+            user.password_hash = password_hash
+            user.must_change_password = bool(must_change_password)
+            user.updated_at = now
+
+
+def create_user_store(url=None):
+    return UserStore(create_session_factory(database_url(url)))

@@ -3,7 +3,8 @@ import altair as alt
 from datetime import timedelta
 
 from reporting.sla import sla_summary, overdue_milestones
-from reporting.analytics import milestone_deadlines, weekly_report
+from reporting.analytics import department_breakdown, milestone_deadlines, weekly_report
+from reporting.departments import DEPARTMENTS
 
 
 def performance_charts(view, summary):
@@ -95,6 +96,25 @@ def render_reporting_views(view):
         queue.sort_values("Open Hours", ascending=False)[
             ["Request", "Summary", "Assignee", "Status", "Hours open", "Needs attention", "Next action"]
         ], width="stretch", hide_index=True,
+    )
+
+
+def render_department_breakdown(df):
+    """Company-wide view for admins: how each department and Ops sub-team is doing."""
+    st.subheader("Company-wide by department")
+    st.caption(
+        "Every request across the company, grouped by the department that owns it, "
+        "with Operations broken down by sub-team. Independent of the filters above so "
+        "departments stay comparable. Breach percentages use recorded and overdue milestones."
+    )
+    breakdown = department_breakdown(df, DEPARTMENTS)
+    if breakdown.empty:
+        st.info("No requests to summarise yet.")
+        return
+    st.dataframe(breakdown, width="stretch", hide_index=True)
+    st.caption(
+        "Needs attention counts each open request once if it is overdue or unassigned. "
+        "Indented rows are Operations sub-teams. Unrouted rows have no recognised department."
     )
 
 
