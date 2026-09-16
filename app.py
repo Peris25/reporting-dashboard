@@ -584,7 +584,9 @@ with st.form("quick_support_intake", clear_on_submit=True):
         assigned_to = st.text_input("Assigned support agent", placeholder="Leave blank if not assigned")
 
     if subteams_for(assign_department):
-        assign_subteam = st.selectbox(f"{assign_department} sub-team *", subteams_for(assign_department), key="intake_subteam")
+        intake_subteam_options = ["— Select sub-team —"] + subteams_for(assign_department)
+        intake_subteam_choice = st.selectbox(f"{assign_department} sub-team *", intake_subteam_options, key="intake_subteam")
+        assign_subteam = "" if intake_subteam_choice.startswith("—") else intake_subteam_choice
     else:
         assign_subteam = ""
     st.caption(
@@ -697,6 +699,15 @@ else:
     if not can_manage_selected:
         st.info("This request is owned by another department. You have view-only access and can add a note below.")
 
+    # The reassignment department sits outside the form so choosing a department
+    # with sub-teams immediately reveals the required sub-team picker.
+    current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+    new_department = st.selectbox(
+        "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
+        key=f"reassign_dept_{selected_ticket_id}", disabled=not can_manage_selected,
+        help="Reassign this request to another department. Choosing a department with sub-teams requires selecting one below.",
+    )
+
     with st.form("save_edits_form"):
         corrected_reported_at = st.datetime_input(
             "Reported at (Nairobi time)", value=nairobi_input_value(reported_time(selected)), key=f"edit_reported_at_{selected_ticket_id}",
@@ -733,24 +744,18 @@ else:
                 value=bool(normalize_text(selected["Callback Completed At"])),
             )
 
-        route_left, route_right = st.columns(2)
-        with route_left:
-            dept_value = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
-            new_department = st.selectbox(
-                "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(dept_value),
-                help="Reassign this request to another department. Save to apply.",
+        route_subteams = subteams_for(new_department)
+        if route_subteams:
+            current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
+            route_options = ["— Select sub-team —"] + route_subteams
+            route_choice = st.selectbox(
+                f"{new_department} sub-team *", route_options,
+                index=route_options.index(current_subteam) if current_subteam in route_options else 0,
+                help="Required for this department. Pick the exact team that owns this request.",
             )
-        with route_right:
-            route_subteams = subteams_for(new_department)
-            if route_subteams:
-                current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
-                new_subteam = st.selectbox(
-                    "Sub-team", route_subteams,
-                    index=route_subteams.index(current_subteam) if current_subteam in route_subteams else 0,
-                )
-            else:
-                new_subteam = ""
-                st.caption("This department has no sub-teams.")
+            new_subteam = "" if route_choice.startswith("—") else route_choice
+        else:
+            new_subteam = ""
 
         resolution_summary = st.text_area(
             "Resolution summary",
@@ -784,6 +789,9 @@ else:
     if save_edits or mark_responded or mark_diagnosed:
         if not can_manage_selected:
             st.error("You do not have permission to edit this request.")
+            st.stop()
+        if subteams_for(new_department) and not clean_subteam(new_department, new_subteam):
+            st.error(f"Select a {new_department} sub-team before saving.")
             st.stop()
         base = read_df(ws, REQUIRED_HEADERS)
         base = pd.DataFrame(base)
