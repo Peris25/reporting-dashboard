@@ -374,7 +374,9 @@ view_all_user = current_user.can_view_all  # may see every department
 render_brand_header()
 render_dashboard_hero()
 
-render_sidebar_header()
+# The workspace card reflects the signed-in user's department so members of every
+# department feel at home (IT sees "IT Support", HR sees "HR Support", etc.).
+render_sidebar_header(f"{current_user.department} Support")
 
 df = read_df(ws, REQUIRED_HEADERS)
 activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
