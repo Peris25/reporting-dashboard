@@ -368,7 +368,8 @@ else:
     require_login()
     current_user = OPEN_ADMIN
 
-is_admin_user = current_user.is_admin
+is_admin_user = current_user.is_admin  # may manage any request and delete
+view_all_user = current_user.can_view_all  # may see every department
 
 render_brand_header()
 render_dashboard_hero()
@@ -390,25 +391,26 @@ df["Updated At"] = df["Updated At"].astype(str).str.strip()
 df = normalize_department_columns(enrich_tickets(df, DIAGNOSIS_SLA_HOURS, RESOLUTION_SLA_HOURS))
 
 # Scope every request to what this user may see before any in-page filtering.
-scoped_df = visible_tickets(df, department=current_user.department, admin=is_admin_user)
+scoped_df = visible_tickets(df, department=current_user.department, admin=view_all_user)
 
 # ---- Sidebar identity + filters ----
+access_note = "  ·  Admin (all departments)" if is_admin_user else ("  ·  Full view (all departments)" if view_all_user else "")
 st.sidebar.caption(
     f"Signed in as **{current_user.display_name}**"
     f"  ·  {current_user.department}"
     + (f" ({current_user.subteam})" if current_user.subteam else "")
-    + ("  ·  Admin (all departments)" if is_admin_user else "")
+    + access_note
 )
 
-# Admins can scope the whole dashboard to one department; members are already
-# scoped to their own department, so this filter is hidden for them.
-if is_admin_user:
+# Users with the global view can scope the whole dashboard to one department;
+# department members are already scoped to their own, so this filter is hidden.
+if view_all_user:
     department_filter = st.sidebar.selectbox("Department", [ALL_DEPARTMENTS_OPTION] + DEPARTMENTS)
 else:
     department_filter = ALL_DEPARTMENTS_OPTION
 
 # The sub-team filter appears when the department in view has sub-teams.
-effective_department = department_filter if is_admin_user else current_user.department
+effective_department = department_filter if view_all_user else current_user.department
 subteam_options = subteams_for(effective_department) if effective_department != ALL_DEPARTMENTS_OPTION else []
 if subteam_options:
     subteam_filter = st.sidebar.selectbox("Operations sub-team", [ALL_SUBTEAMS_OPTION] + subteam_options)
@@ -443,7 +445,7 @@ def render_live_reporting():
         fresh[field] = fresh[field].fillna("").astype(str).str.strip()
     fresh["Status"] = fresh["Status"].str.lower()
     live_df = normalize_department_columns(enrich_tickets(fresh, now=refreshed_at))
-    live_role = visible_tickets(live_df, department=current_user.department, admin=is_admin_user)
+    live_role = visible_tickets(live_df, department=current_user.department, admin=view_all_user)
     live_view = filter_requests(live_role, status_filter, priority_filter, month_filter, owner_filter, search, department_filter, subteam_filter)
     # The weekly comparison ignores the in-page filters but keeps the department scope.
     weekly_scope = filter_requests(live_role, department=department_filter, subteam=subteam_filter)
@@ -499,7 +501,7 @@ def render_live_reporting():
     render_reporting_views(live_view)
     st.divider()
 
-    if is_admin_user:
+    if view_all_user:
         render_department_breakdown(live_role)
         st.divider()
 

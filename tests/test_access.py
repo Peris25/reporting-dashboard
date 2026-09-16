@@ -2,8 +2,8 @@ import pandas as pd
 import pytest
 
 from reporting.access import (
-    CurrentUser, can_delete, can_manage, clean_subteam, generate_temp_password,
-    hash_password, verify_password, visible_tickets,
+    CurrentUser, can_delete, can_manage, can_view_all, clean_subteam, generate_temp_password,
+    hash_password, is_admin, verify_password, visible_tickets,
 )
 
 
@@ -54,10 +54,27 @@ def test_member_unknown_department_sees_nothing():
     assert visible_tickets(make_df(), department="", admin=False).empty
 
 
-def test_currentuser_admin_flag():
-    assert CurrentUser("a", "A", "IT", role="member").is_admin
-    assert not CurrentUser("b", "B", "HR", role="member").is_admin
-    assert CurrentUser("c", "C", "HR", role="admin").is_admin
+def test_admin_powers_come_from_role_only():
+    # IT support (member) sees everything but does not get admin powers.
+    it_member = CurrentUser("a", "A", "IT", role="member")
+    assert not it_member.is_admin
+    assert it_member.can_view_all
+    # A plain department member neither sees all nor has admin powers.
+    hr_member = CurrentUser("b", "B", "HR", role="member")
+    assert not hr_member.is_admin
+    assert not hr_member.can_view_all
+    # Admins have both, in any department.
+    hr_admin = CurrentUser("c", "C", "HR", role="admin")
+    assert hr_admin.is_admin
+    assert hr_admin.can_view_all
+
+
+def test_is_admin_and_view_all_helpers():
+    assert is_admin("admin")
+    assert not is_admin("member")
+    assert can_view_all("member", "IT")
+    assert not can_view_all("member", "HR")
+    assert can_view_all("admin", "HR")
 
 
 def test_can_manage_rules():

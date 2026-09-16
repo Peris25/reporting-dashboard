@@ -55,20 +55,41 @@ class CurrentUser:
 
     @property
     def is_admin(self):
-        return self.role == "admin" or is_global_view(self.department)
+        """Admin powers: manage any request and delete. Tied to the role only."""
+        return is_admin(self.role)
+
+    @property
+    def can_view_all(self):
+        """Global read view across every department. IT has it, so do admins."""
+        return can_view_all(self.role, self.department)
 
 
-def is_admin(role, department):
-    """True when the account can see and manage every department's requests."""
-    return str(role or "").strip().lower() == "admin" or is_global_view(department)
+def is_admin(role, department=None):
+    """Admin powers (manage any request, delete) come from the admin role.
+
+    The department argument is accepted for call-site symmetry and ignored, so
+    that global read access (see can_view_all) stays separate from admin powers.
+    """
+    return str(role or "").strip().lower() == "admin"
+
+
+def can_view_all(role, department):
+    """True when the account can see every department's requests.
+
+    Admins can, and so can members of the global-view department (IT), which
+    lets IT support see everything without granting delete or cross-department
+    edit powers.
+    """
+    return is_admin(role) or is_global_view(department)
 
 
 def visible_tickets(df, *, department, admin):
     """Scope a ticket dataframe to what a user is allowed to see.
 
-    Admins see everything. Everyone else sees requests their department owns
-    (Assigned Department) plus requests their department raised (Reporting
-    Department), so work sent to them and work they raised are both visible.
+    ``admin`` here means "may view all departments" (pass can_view_all). Everyone
+    else sees requests their department owns (Assigned Department) plus requests
+    their department raised (Reporting Department), so work sent to them and work
+    they raised are both visible.
     """
     if admin:
         return df

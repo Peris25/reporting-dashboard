@@ -49,8 +49,8 @@ When you log a request you assign it to any department, your own or another. The
 ### What each role sees and can do
 
 - **A department member** sees requests their department owns plus requests their department raised, so both work sent to them and work they raised are visible. They can create requests, and edit, progress, close, or reassign only the requests their department owns. On requests owned by another department they have view-only access and can add a note.
-- **IT is the global-view department.** IT accounts (and any account with the `admin` role) see every request across the company. A **Department** filter in the sidebar scopes the whole dashboard, including KPIs, charts, exports, and the weekly comparison, to one department. A **Company-wide by department** table shows open, needs-attention, breach percentages, and average closure TAT for each department and Operations sub-team, so the weakest links are visible at a glance.
-- **Deletion** is restricted to admins.
+- **IT has the global view.** Every IT account, and any account with the `admin` role, sees every request across the company. A **Department** filter in the sidebar scopes the whole dashboard, including KPIs, charts, exports, and the weekly comparison, to one department. A **Company-wide by department** table shows open, needs-attention, breach percentages, and average closure TAT for each department and Operations sub-team, so the weakest links are visible at a glance.
+- **Admin powers are separate from the global view.** The global view is read access across all departments. Managing any department's requests and deleting are admin powers that come only from the `admin` role. So IT support (an IT member) sees everything but can edit only IT-owned requests and cannot delete, while an IT admin can manage and delete anything.
 
 Legacy requests created before departments existed are routed to IT so nothing is hidden.
 
