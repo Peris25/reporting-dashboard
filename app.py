@@ -16,8 +16,10 @@ from reporting.views import render_department_breakdown, render_reporting_views,
 from reporting.analytics import filter_requests, milestone_deadlines
 from reporting.workflow import can_transition
 from reporting.history import request_history
-from reporting.database import create_user_store, database_handles
+from reporting.database import create_draft_store, create_user_store, database_handles
 from reporting.bootstrap import initialize_database
+from reporting.whatsapp import parse_export
+from reporting.intake import extract_issues, DEFAULT_CATEGORIES
 from reporting.access import (
     CurrentUser, can_delete, can_manage, clean_subteam, hash_password, verify_password, visible_tickets,
 )
@@ -57,8 +59,13 @@ DASHBOARD_PASSWORD_HASH = setting("DASHBOARD_PASSWORD_HASH")
 # global view.
 BOOTSTRAP_ADMIN_USER = str(setting("DASHBOARD_ADMIN_USER")).strip()
 BOOTSTRAP_ADMIN_PASSWORD = setting("DASHBOARD_ADMIN_PASSWORD")
+# WhatsApp intake uses OpenAI to split and categorise chats when a key is set;
+# without one it falls back to a single heuristic draft.
+OPENAI_API_KEY = setting("OPENAI_API_KEY")
+OPENAI_MODEL = setting("OPENAI_MODEL", "gpt-4o-mini")
 
 REQUIRED_HEADERS = TICKET_HEADERS
+INTAKE_CATEGORIES = DEFAULT_CATEGORIES
 
 
 # ---- Google Sheets helpers ----
@@ -182,6 +189,27 @@ def normalize_text(value):
     return str(value).strip()
 
 
+def option_index(options, value, default=0):
+    text = str(value or "").strip().lower()
+    for position, option in enumerate(options):
+        if option.lower() == text:
+            return position
+    return default
+
+
+def read_whatsapp_upload(raw_bytes, filename):
+    """Return the chat text from a .txt export or the _chat.txt inside a .zip."""
+    if str(filename).lower().endswith(".zip"):
+        import io
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+            names = [name for name in archive.namelist() if name.lower().endswith(".txt")]
+            preferred = next((name for name in names if "_chat" in name.lower()), names[0] if names else None)
+            return archive.read(preferred).decode("utf-8", errors="replace") if preferred else ""
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
 def parse_dt(series_or_value):
     return pd.to_datetime(series_or_value, errors="coerce")
 
@@ -255,6 +283,12 @@ def require_login():
 def get_user_store():
     configured_url = setting("DATABASE_URL")
     return create_user_store(configured_url or None)
+
+
+@st.cache_resource
+def get_draft_store():
+    configured_url = setting("DATABASE_URL")
+    return create_draft_store(configured_url or None)
 
 
 def current_user_from(account):
@@ -546,6 +580,116 @@ with st.expander("Import and normalize Jira data"):
                 ]
                 activity_ws.append_rows(activity_rows)
                 st.success(f"Imported {len(new_rows)} new Jira ticket(s).")
+                st.rerun()
+
+st.divider()
+
+# ---- WhatsApp intake ----
+if USE_DATABASE:
+    draft_store = get_draft_store()
+    with st.expander("Import from WhatsApp"):
+        st.caption(
+            "Upload an exported WhatsApp chat (.txt, or the .zip export). It is split into "
+            "draft requests you review below, then approve as support requests or reject. "
+            + ("AI categorisation is on." if OPENAI_API_KEY else "No OpenAI key set, so each chat becomes one draft you can edit.")
+        )
+        wa_upload = st.file_uploader("WhatsApp chat export", type=["txt", "zip"], key="whatsapp_import")
+        if wa_upload is not None and st.button("Scan chat for issues", key="scan_whatsapp"):
+            text = read_whatsapp_upload(wa_upload.getvalue(), wa_upload.name)
+            issues = extract_issues(
+                parse_export(text), categories=INTAKE_CATEGORIES,
+                api_key=OPENAI_API_KEY or None, model=OPENAI_MODEL,
+            )
+            if not issues:
+                st.warning("No messages were found. Export the chat without media and try again.")
+            else:
+                for issue in issues:
+                    draft_store.add({**issue, "source": "whatsapp", "source_reference": wa_upload.name})
+                st.success(f"Created {len(issues)} draft request(s) for review below.")
+                st.rerun()
+
+    # ---- Pending intake (drafts awaiting approval) ----
+    pending_drafts = draft_store.list("pending")
+    visible_drafts = [
+        draft for draft in pending_drafts
+        if view_all_user or normalize_department(draft["suggested_department"]) == current_user.department
+    ]
+    st.subheader(f"Pending intake ({len(visible_drafts)})")
+    st.caption("Draft requests from WhatsApp. Approve to create a real support request, or reject. Drafts do not count toward SLA until approved.")
+    if not visible_drafts:
+        st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
+    priority_choices = ["Low", "Medium", "High", "Highest"]
+    for draft in visible_drafts:
+        did = draft["draft_id"]
+        header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
+        with st.expander(header):
+            summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
+            description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                category = st.selectbox("Category", INTAKE_CATEGORIES, index=option_index(INTAKE_CATEGORIES, draft["category"], len(INTAKE_CATEGORIES) - 1), key=f"dcat_{did}")
+            with col_b:
+                priority = st.selectbox("Priority", priority_choices, index=option_index(priority_choices, draft["priority"], 1), key=f"dpri_{did}")
+            with col_c:
+                dept_default = normalize_department(draft["suggested_department"]) or current_user.department
+                if dept_default not in DEPARTMENTS:
+                    dept_default = DEPARTMENTS[0]
+                department = st.selectbox("Assign to department", DEPARTMENTS, index=DEPARTMENTS.index(dept_default), key=f"ddept_{did}")
+            draft_subteams = subteams_for(department)
+            if draft_subteams:
+                current_sub = clean_subteam(department, draft["suggested_subteam"])
+                sub_options = ["— Select sub-team —"] + draft_subteams
+                sub_choice = st.selectbox(
+                    f"{department} sub-team *", sub_options,
+                    index=sub_options.index(current_sub) if current_sub in sub_options else 0, key=f"dsub_{did}",
+                )
+                draft_subteam = "" if sub_choice.startswith("—") else sub_choice
+            else:
+                draft_subteam = ""
+            if draft["requester_name"] or draft["contact"]:
+                st.caption(f"Requester: {draft['requester_name'] or 'Unknown'}  ·  {draft['contact'] or 'no contact'}")
+            if draft["excerpt"]:
+                st.caption("Chat excerpt")
+                st.code(draft["excerpt"])
+            review_note = st.text_input("Note (or reason for rejecting)", key=f"dnote_{did}")
+            may_route = can_manage(department=current_user.department, admin=is_admin_user, ticket_department=department)
+            approve_col, reject_col = st.columns(2)
+            approve = approve_col.button("Approve as support request", type="primary", key=f"dok_{did}", disabled=not may_route)
+            reject = reject_col.button("Reject", key=f"dno_{did}", disabled=not may_route)
+            if not may_route:
+                st.caption("Only the owning department or an admin can approve or reject this draft.")
+
+            if approve:
+                if not summary.strip():
+                    st.error("Add a summary before approving.")
+                    st.stop()
+                if draft_subteams and not draft_subteam:
+                    st.error(f"Select a {department} sub-team before approving.")
+                    st.stop()
+                ticket_id = str(uuid.uuid4())
+                now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
+                reported_ts = pd.to_datetime(draft["reported_at"], errors="coerce", utc=True) if draft["reported_at"] else pd.NaT
+                reported_value = draft["reported_at"] if (pd.notna(reported_ts) and reported_ts <= pd.Timestamp.now(tz="UTC")) else now_stamp
+                new = {
+                    "Ticket ID": ticket_id, "Support Request Number": support_number,
+                    "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
+                    "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
+                    "Reported At": reported_value, "Requester Type": "External Clients",
+                    "Requester Name": draft["requester_name"] or "", "Channel": "WhatsApp",
+                    "Customer WhatsApp": draft["contact"] or "",
+                    "Assigned Department": department, "Assigned Sub-team": draft_subteam,
+                    "Reporting Department": current_user.department, "Callback Required": "No",
+                }
+                append_ticket(ws, new)
+                append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
+                append_activity(activity_ws, ticket_id, "intake_approved", "Support Request Number", "", support_number, f"Approved from WhatsApp draft by {current_user.username}")
+                draft_store.resolve(did, status="approved", reviewed_by=current_user.username, review_note=review_note.strip(), approved_ticket_id=ticket_id)
+                st.success(f"Approved as {support_number}.")
+                st.rerun()
+            if reject:
+                draft_store.resolve(did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip())
+                st.info("Draft rejected.")
                 st.rerun()
 
 st.divider()

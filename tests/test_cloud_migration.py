@@ -18,7 +18,7 @@ def test_cloud_initialization_is_repeatable_and_keeps_records(tmp_path):
     initialize_database(url)
     with engine.connect() as connection:
         assert connection.execute(select(Ticket.ticket_id)).scalar_one() == "keep"
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260916_05"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260916_06"
     engine.dispose()
 
 

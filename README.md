@@ -54,6 +54,25 @@ When you log a request you assign it to any department, your own or another. The
 
 Legacy requests created before departments existed are routed to IT so nothing is hidden.
 
+## WhatsApp intake
+
+Support conversations that happen over WhatsApp can be brought into the dashboard
+under **Import from WhatsApp**. Export a chat from WhatsApp (Chat → Export chat →
+Without media) and upload the `.txt` or the `.zip`. The chat is parsed and turned
+into one or more **draft requests**, which appear under **Pending intake**.
+
+Drafts are a staging area. They do not count toward SLA or analytics. A reviewer
+opens each draft, adjusts the summary, category, priority, and the department (a
+sub-team is required when routing to Operations), then either **Approves** it,
+which creates a real support request routed to that department, or **Rejects** it
+with a note. Approving records the reviewer and links the draft to the new ticket.
+
+When `OPENAI_API_KEY` is set, the chat is split into distinct issues and each is
+summarised and categorised automatically (the model only ever suggests values
+from the dashboard's own categories, departments, and sub-teams). Without a key,
+each upload becomes a single draft you fill in by hand, so the feature works
+either way. Set `OPENAI_MODEL` to choose the model (default `gpt-4o-mini`).
+
 ### User accounts
 
 Accounts are named users with a hashed password, a department, an optional Operations sub-team, and a role of `member` or `admin`. Seed or update them from a CSV:
@@ -185,7 +204,7 @@ pytest
 
 Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
 
-The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, and the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 53 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store), and the WhatsApp intake pipeline (chat parsing, categorisation fallback, and the draft store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 61 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
 
 ## Branding
 
