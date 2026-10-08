@@ -95,6 +95,20 @@ python scripts/seed_users.py users_seed.csv
 
 The CSV columns are `username, display_name, department, subteam, role, temp_password`. Leave `temp_password` blank to have one generated and printed once. Every seeded account must change its password on first login. Passwords are stored only as salted PBKDF2 hashes, and `users_seed.csv` is git-ignored because it holds names and temporary passwords.
 
+Re-running the seeder is also how you **reset passwords**: list the users whose passwords you want to rotate (one row each, or the whole roster) and run it again. Each listed account gets a new temporary password and is required to change it on next login; accounts not listed are untouched. There is no self-service reset screen yet.
+
+To **email** each user their temporary password instead of printing it, add `--email` and configure an SMTP sender (for Microsoft 365, `smtp.office365.com`):
+
+```bash
+export SMTP_USERNAME=support@solvit.co.ke
+export SMTP_PASSWORD=...            # mailbox or app password
+export SMTP_FROM=support@solvit.co.ke
+export APP_URL=https://your-app.streamlit.app   # optional sign-in link
+python scripts/seed_users.py users_seed.csv --email
+```
+
+Usernames are the recipients' email addresses. Any address that fails to send is reported with its password so you can share it manually. Since every account must change its password on first login, the emailed value is a short-lived temporary one.
+
 Login is required only once auth is configured, meaning at least one account exists or a bootstrap admin is set. Set `DASHBOARD_ADMIN_USER` and `DASHBOARD_ADMIN_PASSWORD` for a bootstrap admin that can sign in before any accounts are seeded and recover access if every account is locked out; it always has the IT global view. Run `alembic upgrade head` (or deploy with `AUTO_MIGRATE=true`) so the `users` table and the routing columns are created. The Google Sheets fallback keeps the earlier shared-password gate and treats its single user as an IT admin.
 
 ## SLA and turnaround time
@@ -215,7 +229,7 @@ pytest
 
 Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
 
-The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store), and the WhatsApp intake pipeline (chat parsing, categorisation fallback, and the draft store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 62 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store), the WhatsApp intake pipeline (chat parsing, categorisation fallback, and the draft store), and the SMTP account-email helper. App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 67 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
 
 ## Branding
 
