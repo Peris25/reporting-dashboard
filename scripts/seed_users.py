@@ -14,9 +14,20 @@ CSV columns (a header row is required):
   global view regardless of role.
 - temp_password is optional. Leave it blank to have one generated and printed.
 
+Pass --email to send each user their temporary password over SMTP instead of
+printing it. Configure the sender with these environment variables:
+
+    SMTP_HOST      (default smtp.office365.com)
+    SMTP_PORT      (default 587)
+    SMTP_USERNAME  the mailbox that authenticates, e.g. support@solvit.co.ke
+    SMTP_PASSWORD  that mailbox's password or app password
+    SMTP_FROM      the From address (defaults to SMTP_USERNAME)
+    APP_URL        optional sign-in link included in the email
+
 Usage:
     python scripts/seed_users.py users_seed.csv
     python scripts/seed_users.py users_seed.csv --database-url postgresql://...
+    python scripts/seed_users.py users_seed.csv --email
 """
 import argparse
 import csv
@@ -28,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reporting.access import generate_temp_password, hash_password
 from reporting.database import create_user_store
 from reporting.departments import DEPARTMENTS, normalize_department, normalize_subteam
+from reporting.notifications import SMTPConfig, send_email, temp_password_email
 
 
 def load_rows(path):
@@ -39,10 +51,21 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Seed dashboard user accounts from a CSV.")
     parser.add_argument("csv_path", help="Path to the users CSV.")
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="Override DATABASE_URL.")
+    parser.add_argument("--email", action="store_true",
+                        help="Email each user their temporary password over SMTP (see SMTP_* env vars).")
+    parser.add_argument("--app-url", default=os.getenv("APP_URL", ""),
+                        help="Dashboard URL included in the email (optional).")
     args = parser.parse_args(argv)
+
+    smtp = SMTPConfig.from_env(os.environ)
+    if args.email and not smtp.is_configured():
+        print("Email requested but SMTP is not configured. Set SMTP_USERNAME, SMTP_PASSWORD, "
+              "and SMTP_FROM (and optionally SMTP_HOST, default smtp.office365.com, and SMTP_PORT, default 587).")
+        return
 
     store = create_user_store(args.database_url or None)
     generated = []
+    accounts = []  # (username, display_name, temp_password)
     upserted = 0
     for row in load_rows(args.csv_path):
         username = (row.get("username") or "").strip()
@@ -55,13 +78,14 @@ def main(argv=None):
         subteam = normalize_subteam(department, row.get("subteam"))
         role = (row.get("role") or "member").strip().lower()
         role = role if role in {"member", "admin"} else "member"
+        display_name = (row.get("display_name") or username).strip()
         temp_password = (row.get("temp_password") or "").strip()
         if not temp_password:
             temp_password = generate_temp_password()
             generated.append((username, temp_password))
         store.upsert(
             username=username,
-            display_name=(row.get("display_name") or username).strip(),
+            display_name=display_name,
             password_hash=hash_password(temp_password),
             department=department,
             subteam=subteam,
@@ -69,10 +93,26 @@ def main(argv=None):
             must_change_password=True,
             active=True,
         )
+        accounts.append((username, display_name, temp_password))
         upserted += 1
 
     print(f"Upserted {upserted} account(s).")
-    if generated:
+
+    emailed, failures = 0, []
+    if args.email:
+        for username, display_name, temp_password in accounts:
+            subject, body = temp_password_email(display_name, username, temp_password, app_url=args.app_url)
+            try:
+                send_email(smtp, username, subject, body)
+                emailed += 1
+            except Exception as error:  # keep going; report at the end
+                failures.append((username, temp_password, str(error)))
+        print(f"Emailed {emailed} of {len(accounts)} temporary password(s) from {smtp.sender}.")
+        if failures:
+            print("Could not email these (share their passwords manually):")
+            for username, password, error in failures:
+                print(f"  {username}: {password}   [{error}]")
+    elif generated:
         print("Generated temporary passwords (share securely, they are shown only once):")
         for username, password in generated:
             print(f"  {username}: {password}")
