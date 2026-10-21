@@ -1,0 +1,29 @@
+name: Sync weekly tasks
+
+# Runs after the Thursday review meeting (Friday 07:00 EAT = 04:00 UTC) so the
+# week that was just filled in the tracker is imported, and can also be run
+# manually. Re-runs are safe: existing tasks are refreshed, statuses preserved.
+on:
+  schedule:
+    - cron: "0 4 * * 5"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install "SQLAlchemy>=2,<3" "psycopg[binary]>=3.2,<4" "requests>=2.31,<3"
+      - name: Sync weekly tasks
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+          TRACKER_SHARE_URL: ${{ secrets.TRACKER_SHARE_URL }}
+          TRACKER_WORKSHEET: ${{ secrets.TRACKER_WORKSHEET }}
+        run: python scripts/sync_weekly_tasks.py

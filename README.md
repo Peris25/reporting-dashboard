@@ -37,7 +37,7 @@ Existing Solver IDs remain stored separately for compatibility; they are not rei
 
 ## Roles and departments
 
-The dashboard supports multiple departments with named user accounts. The departments are **IT, HR, Operations, and BD**. Operations is split into three sub-teams, **Scheduling, Approval, and Solver (Submissions)**, which are tagged on each request and used for filtering rather than for separate logins. The same SLA targets apply to every department.
+The dashboard supports multiple departments with named user accounts. The departments are **IT, HR and Admin, Operations, and BD**. Operations is split into **Scheduling, Approval, and Solver (Submissions)**, and HR and Admin into **HR** and **Admin**. Sub-teams are tagged on each request and used for filtering rather than for separate logins. The same SLA targets apply to every department. The legacy "HR" department name resolves to "HR and Admin" automatically.
 
 Each request carries three routing fields on top of the existing "Who needs support?" requester type, which is a separate question about who reported the issue.
 
@@ -110,6 +110,43 @@ python scripts/seed_users.py users_seed.csv --email
 Usernames are the recipients' email addresses. Any address that fails to send is reported with its password so you can share it manually. Since every account must change its password on first login, the emailed value is a short-lived temporary one.
 
 Login is required only once auth is configured, meaning at least one account exists or a bootstrap admin is set. Set `DASHBOARD_ADMIN_USER` and `DASHBOARD_ADMIN_PASSWORD` for a bootstrap admin that can sign in before any accounts are seeded and recover access if every account is locked out; it always has the IT global view. Run `alembic upgrade head` (or deploy with `AUTO_MIGRATE=true`) so the `users` table and the routing columns are created. The Google Sheets fallback keeps the earlier shared-password gate and treats its single user as an IT admin.
+
+## Weekly tasks
+
+The **Weekly Manager Tracker** (a Microsoft 365 workbook) drives a **Weekly tasks**
+area that is tracked separately from support requests, so it never affects the
+support SLA metrics. Each KPI Area's weekly action is routed to a team:
+
+| KPI Area | Routes to |
+|---|---|
+| Requests | BD |
+| Scheduled Rate | Operations · Scheduling |
+| Inspected Rate | Operations · Solver (Submissions) |
+| Approved Rate | Operations · Approval |
+| Solvit Systems | IT |
+| HR, Comms Response | HR and Admin · HR |
+| Administration | HR and Admin · Admin |
+
+**Cadence.** Each Thursday review meeting looks at the week that just ended, and
+that week's tasks are due at the following Thursday meeting. The dashboard works
+out the active week from the date, so it always shows the tasks due at the next
+meeting, with that meeting's date as the due date.
+
+**Status.** A task's status (Yet to Start / On Track / Off Track / Complete) is
+seeded from the sheet if present, but is edited on the dashboard, which is the
+source of truth. A re-sync refreshes the task and comment text but never
+overwrites a status set on the dashboard. The weekly metric per team is Complete
+divided by the week's tasks.
+
+**Live sync.** An admin presses **Sync weekly tasks**, and a scheduled GitHub
+Action (`.github/workflows/weekly-sync.yml`, Friday mornings) runs the same sync
+weekly. Both read the workbook live through the Microsoft Graph Excel API using a
+Graph app with the **`Files.Read.All`** application permission (admin consent
+required). Configure `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`,
+`TRACKER_SHARE_URL` (the workbook's sharing link), and optionally
+`TRACKER_WORKSHEET` (default `Weekly Manager Tracker`). The GitHub Action reads
+the same values from repository Actions secrets. Re-syncing is safe and
+idempotent (tasks are keyed by week and KPI area).
 
 ## SLA and turnaround time
 
@@ -229,7 +266,7 @@ pytest
 
 Business rules live under `reporting/`, separately from the Streamlit interface, so SLA, workflow, and import behavior can be tested without connecting to Google Sheets.
 
-The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store), the WhatsApp intake pipeline (chat parsing, categorisation fallback, and the draft store), and the SMTP account-email helper. App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 67 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
+The suite also covers deadline boundaries, weekly period comparisons, ownership filters, one-click milestone updates, direct closure and reopening, activity history, preservation of legacy Solver IDs during migration, the department roles model (password hashing, per-department visibility scoping, edit and delete permissions, per-department analytics, and the user account store), the WhatsApp intake pipeline (chat parsing, categorisation fallback, and the draft store), the SMTP account-email helper, and the weekly tasks pipeline (tracker parsing, the meeting cadence, KPI routing, the Graph reader, and the weekly-task store). App tests use temporary SQLite databases; they do not write to production. The latest feature verification passed all 77 tests, including external-client intake with and without optional job details. App tests validate chart specifications without rendering charts to avoid local native-library restrictions.
 
 ## Branding
 

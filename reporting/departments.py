@@ -6,14 +6,22 @@ Operations is split into sub-teams that are tagged on the request and used for
 filtering rather than for separate logins.
 """
 
-DEPARTMENTS = ["IT", "HR", "Operations", "BD"]
+DEPARTMENTS = ["IT", "HR and Admin", "Operations", "BD"]
 
 # The department whose members can see and manage every request.
 GLOBAL_VIEW_DEPARTMENT = "IT"
 
-# Sub-teams live under a parent department. Only Operations has them today.
+# Sub-teams live under a parent department, tagged on a request and used for
+# filtering rather than for separate logins.
 SUBTEAMS = {
     "Operations": ["Scheduling", "Approval", "Solver (Submissions)"],
+    "HR and Admin": ["HR", "Admin"],
+}
+
+# Legacy department names mapped to their current canonical name.
+DEPARTMENT_ALIASES = {
+    "hr": "HR and Admin",
+    "hr and admin": "HR and Admin",
 }
 
 ROLES = ["member", "admin"]
@@ -23,12 +31,16 @@ ALL_SUBTEAMS_OPTION = "All sub-teams"
 
 
 def normalize_department(value):
-    """Return the canonical department name, or "" if it is not recognised."""
+    """Return the canonical department name, or "" if it is not recognised.
+
+    Legacy names (for example "HR" before it became "HR and Admin") resolve to
+    their current canonical department.
+    """
     text = str(value or "").strip()
     for department in DEPARTMENTS:
         if text.lower() == department.lower():
             return department
-    return ""
+    return DEPARTMENT_ALIASES.get(text.lower(), "")
 
 
 def subteams_for(department):
