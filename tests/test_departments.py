@@ -28,9 +28,11 @@ def test_config_helpers():
     assert normalize_department("operations") == "Operations"
     assert normalize_department("Legal") == ""
     assert subteams_for("Operations") == ["Scheduling", "Approval", "Solver (Submissions)"]
-    assert not has_subteams("HR")
+    assert not has_subteams("BD")
+    assert has_subteams("HR and Admin")  # HR renamed to HR and Admin with sub-teams
+    assert normalize_department("HR") == "HR and Admin"  # legacy alias
     assert normalize_subteam("Operations", "approval") == "Approval"
-    assert normalize_subteam("HR", "approval") == ""
+    assert normalize_subteam("HR and Admin", "comms") == ""
 
 
 def test_department_filter():

@@ -119,6 +119,27 @@ class DraftRequest(Base):
     source_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
 
 
+class WeeklyTask(Base):
+    """A weekly action from the Manager Tracker, tracked separately from tickets."""
+
+    __tablename__ = "weekly_tasks"
+
+    task_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    kpi_area: Mapped[str] = mapped_column(String(100))
+    department: Mapped[str | None] = mapped_column(String(60), index=True)
+    subteam: Mapped[str | None] = mapped_column(String(60))
+    week_label: Mapped[str | None] = mapped_column(String(80))
+    week_start: Mapped[str | None] = mapped_column(String(20), index=True)
+    week_end: Mapped[str | None] = mapped_column(String(20))
+    due_at: Mapped[str | None] = mapped_column(String(20))
+    task: Mapped[str] = mapped_column(Text, default="")
+    comments: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), index=True, default="Yet to Start")
+    created_at: Mapped[str] = mapped_column(String(40), default="")
+    updated_at: Mapped[str] = mapped_column(String(40), default="")
+
+
 TICKET_MAP = {
     "Ticket ID": "ticket_id", "External Key": "external_key", "Summary": "summary",
     "Description": "description", "Status": "status", "Priority": "priority",
@@ -406,3 +427,84 @@ class DraftStore:
 
 def create_draft_store(url=None):
     return DraftStore(create_session_factory(database_url(url)))
+
+
+_WEEKLY_FIELDS = (
+    "task_id", "source_key", "kpi_area", "department", "subteam", "week_label",
+    "week_start", "week_end", "due_at", "task", "comments", "status",
+    "created_at", "updated_at",
+)
+
+
+def _weekly_snapshot(task):
+    if task is None:
+        return None
+    return {field: getattr(task, field) for field in _WEEKLY_FIELDS}
+
+
+class WeeklyTaskStore:
+    """Persistence for weekly tasks synced from the Manager Tracker."""
+
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def upsert_from_sheet(self, values):
+        """Insert a new weekly task, or refresh an existing one by source_key.
+
+        The sheet is the source of the task text, comments, and schedule. The
+        status is only seeded on first import; a status set on the dashboard is
+        preserved on later syncs (people update the dashboard, not the sheet).
+        Returns "created" or "updated".
+        """
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.session_factory.begin() as session:
+            task = session.scalar(select(WeeklyTask).where(WeeklyTask.source_key == values["source_key"]))
+            if task is None:
+                session.add(WeeklyTask(
+                    task_id=str(uuid.uuid4()), source_key=values["source_key"],
+                    kpi_area=values.get("kpi_area"), department=values.get("department"),
+                    subteam=values.get("subteam"), week_label=values.get("week_label"),
+                    week_start=values.get("week_start"), week_end=values.get("week_end"),
+                    due_at=values.get("due_at"), task=values.get("task", ""),
+                    comments=values.get("comments"),
+                    status=values.get("status") or "Yet to Start",
+                    created_at=now, updated_at=now,
+                ))
+                return "created"
+            task.kpi_area = values.get("kpi_area")
+            task.department = values.get("department")
+            task.subteam = values.get("subteam")
+            task.week_label = values.get("week_label")
+            task.week_start = values.get("week_start")
+            task.week_end = values.get("week_end")
+            task.due_at = values.get("due_at")
+            task.task = values.get("task", "")
+            task.comments = values.get("comments")
+            task.updated_at = now
+            # status intentionally preserved
+            return "updated"
+
+    def list(self, *, week_start=None):
+        with self.session_factory() as session:
+            query = select(WeeklyTask).order_by(WeeklyTask.week_start.desc(), WeeklyTask.kpi_area)
+            if week_start:
+                query = query.where(WeeklyTask.week_start == week_start)
+            return [_weekly_snapshot(t) for t in session.scalars(query).all()]
+
+    def weeks(self):
+        with self.session_factory() as session:
+            rows = session.scalars(select(WeeklyTask.week_start).distinct()).all()
+        return sorted({r for r in rows if r}, reverse=True)
+
+    def set_status(self, task_id, status):
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.session_factory.begin() as session:
+            task = session.get(WeeklyTask, task_id)
+            if task is None:
+                raise ValueError("This weekly task no longer exists.")
+            task.status = status
+            task.updated_at = now
+
+
+def create_weekly_task_store(url=None):
+    return WeeklyTaskStore(create_session_factory(database_url(url)))
