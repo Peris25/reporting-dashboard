@@ -16,7 +16,7 @@ from reporting.views import render_department_breakdown, render_reporting_views,
 from reporting.analytics import filter_requests, milestone_deadlines
 from reporting.workflow import can_transition
 from reporting.history import request_history
-from reporting.database import create_draft_store, create_user_store, database_handles
+from reporting.database import DraftStore, create_user_store, database_handles
 from reporting.bootstrap import initialize_database
 from reporting.whatsapp import parse_export, parse_timestamp
 from reporting.workbook_import import import_it_tickets, read_it_workbook
@@ -291,12 +291,6 @@ def require_login():
 def get_user_store():
     configured_url = setting("DATABASE_URL")
     return create_user_store(configured_url or None)
-
-
-@st.cache_resource
-def get_draft_store():
-    configured_url = setting("DATABASE_URL")
-    return create_draft_store(configured_url or None)
 
 
 def current_user_from(account):
@@ -628,7 +622,8 @@ st.divider()
 
 # ---- WhatsApp intake ----
 if USE_DATABASE:
-    draft_store = get_draft_store()
+    # Reuse the connection pool without caching a store instance across app updates.
+    draft_store = DraftStore(ws.session_factory)
     with st.expander("Import from WhatsApp"):
         st.caption(
             "Upload an exported WhatsApp chat (.txt or .zip), choose a date range, and scan it. "
