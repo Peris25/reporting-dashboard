@@ -694,6 +694,8 @@ if USE_DATABASE:
         or normalize_department(draft["suggested_department"]) == current_user.department
     ]
     st.subheader(f"Pending intake ({len(visible_drafts)})")
+    if draft_message := st.session_state.pop("draft_action_message", None):
+        st.info(draft_message)
     st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
     if not visible_drafts:
         st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
@@ -701,7 +703,16 @@ if USE_DATABASE:
     for draft in visible_drafts:
         did = draft["draft_id"]
         header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
-        with st.expander(header):
+        draft_details = st
+        if can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN:
+            draft_details, draft_action = st.columns([11, 1], vertical_alignment="top")
+            if draft_action.button("🗑", help="Delete draft", key=f"delete_draft_{did}"):
+                removed = draft_store.delete_pending(did)
+                st.session_state.draft_action_message = (
+                    "Draft deleted." if removed else "This draft is no longer pending."
+                )
+                st.rerun()
+        with draft_details.expander(header):
             summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
             description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
             col_a, col_b, col_c = st.columns(3)
@@ -764,15 +775,21 @@ if USE_DATABASE:
                     "Assigned Department": department, "Assigned Sub-team": draft_subteam,
                     "Reporting Department": current_user.department, "Callback Required": "No",
                 }
-                append_ticket(ws, new)
-                append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
-                append_activity(activity_ws, ticket_id, "intake_approved", "Support Request Number", "", support_number, f"Approved from WhatsApp draft by {current_user.username}")
-                draft_store.resolve(did, status="approved", reviewed_by=current_user.username, review_note=review_note.strip(), approved_ticket_id=ticket_id)
-                st.success(f"Approved as {support_number}.")
+                approved = draft_store.resolve(
+                    did, status="approved", reviewed_by=current_user.username,
+                    review_note=review_note.strip(), approved_ticket_id=ticket_id, ticket=new,
+                )
+                st.session_state.draft_action_message = (
+                    f"Approved as {support_number}." if approved else "This draft is no longer pending."
+                )
                 st.rerun()
             if reject:
-                draft_store.resolve(did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip())
-                st.info("Draft rejected.")
+                rejected = draft_store.resolve(
+                    did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip(),
+                )
+                st.session_state.draft_action_message = (
+                    "Draft rejected." if rejected else "This draft is no longer pending."
+                )
                 st.rerun()
 
 st.divider()

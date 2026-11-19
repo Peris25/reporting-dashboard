@@ -7,7 +7,7 @@ import uuid
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, delete, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .schema import ACTIVITY_HEADERS, TICKET_HEADERS
@@ -391,17 +391,40 @@ class DraftStore:
         with self.session_factory() as session:
             return _draft_snapshot(session.get(DraftRequest, draft_id))
 
-    def resolve(self, draft_id, *, status, reviewed_by="", review_note="", approved_ticket_id=""):
+    def delete_pending(self, draft_id):
+        with self.session_factory.begin() as session:
+            deleted = session.execute(delete(DraftRequest).where(
+                DraftRequest.draft_id == draft_id, DraftRequest.status == "pending",
+            ))
+            return deleted.rowcount == 1
+
+    def resolve(self, draft_id, *, status, reviewed_by="", review_note="", approved_ticket_id="", ticket=None):
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.session_factory.begin() as session:
-            draft = session.get(DraftRequest, draft_id)
-            if draft is None:
-                raise ValueError("This draft no longer exists.")
-            draft.status = status
-            draft.reviewed_at = now
-            draft.reviewed_by = reviewed_by or None
-            draft.review_note = review_note or None
-            draft.approved_ticket_id = approved_ticket_id or None
+            updated = session.execute(update(DraftRequest).where(
+                DraftRequest.draft_id == draft_id, DraftRequest.status == "pending",
+            ).values(
+                status=status, reviewed_at=now, reviewed_by=reviewed_by or None,
+                review_note=review_note or None, approved_ticket_id=approved_ticket_id or None,
+            ))
+            if updated.rowcount != 1:
+                return False
+            if ticket is not None:
+                session.add(Ticket(**{TICKET_MAP[header]: value for header, value in ticket.items()}))
+                entries = [
+                    ("support_request_created", "Status", "to do", ticket["Description"]),
+                    ("intake_approved", "Support Request Number", ticket["Support Request Number"],
+                     f"Approved from WhatsApp draft by {reviewed_by}"),
+                ]
+                session.add_all([
+                    Activity(
+                        activity_id=str(uuid.uuid4()), ticket_id=approved_ticket_id, action=action,
+                        field=field, old_value="", new_value=value, note=note, timestamp=now,
+                        actor=reviewed_by,
+                    )
+                    for action, field, value, note in entries
+                ])
+            return True
 
 
 def create_draft_store(url=None):
