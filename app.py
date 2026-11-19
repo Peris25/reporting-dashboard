@@ -699,12 +699,36 @@ if USE_DATABASE:
     st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
     if not visible_drafts:
         st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
+    may_delete_drafts = can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN
+    if may_delete_drafts and visible_drafts:
+        with st.expander("Bulk delete drafts"):
+            labels = {
+                draft["draft_id"]: f"{draft['summary'] or 'Draft request'} ({draft['draft_id'][:8]})"
+                for draft in visible_drafts
+            }
+            select_all = st.checkbox(f"Select all {len(labels)} pending drafts", key="delete_all_drafts")
+            selected_drafts = list(labels) if select_all else st.multiselect(
+                "Drafts to delete", options=list(labels), format_func=labels.__getitem__,
+                key="bulk_draft_selection",
+            )
+            if st.button(
+                f"Delete {len(selected_drafts)} selected drafts", icon=":material/delete:",
+                key="bulk_delete_drafts", disabled=not selected_drafts,
+            ):
+                removed = draft_store.delete_pending_many(selected_drafts)
+                st.session_state.draft_action_message = (
+                    f"Deleted {removed} pending draft(s). "
+                    f"{len(selected_drafts) - removed} no longer pending."
+                    if removed != len(selected_drafts)
+                    else f"Deleted {removed} pending draft(s)."
+                )
+                st.rerun()
     priority_choices = ["Low", "Medium", "High", "Highest"]
     for draft in visible_drafts:
         did = draft["draft_id"]
         header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
         draft_details = st
-        if can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN:
+        if may_delete_drafts:
             draft_details, draft_action = st.columns([11, 1], vertical_alignment="top")
             if draft_action.button("🗑", help="Delete draft", key=f"delete_draft_{did}"):
                 removed = draft_store.delete_pending(did)

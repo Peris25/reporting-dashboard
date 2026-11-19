@@ -106,3 +106,14 @@ def test_approval_saves_ticket_and_activity_before_draft_can_be_deleted():
         assert saved.assigned_department == "IT"
         actions = session.scalars(select(Activity.action).where(Activity.ticket_id == saved.ticket_id)).all()
         assert set(actions) == {"support_request_created", "intake_approved"}
+
+
+def test_bulk_delete_skips_approved_missing_and_unselected_drafts():
+    store = create_draft_store("sqlite://")
+    first, second, other, approved = [store.add({"summary": str(i)}) for i in range(4)]
+    assert store.resolve(approved, status="approved")
+    assert store.delete_pending_many([]) == 0
+    assert store.delete_pending_many([first, second, first, approved, "missing"]) == 2
+    assert store.delete_pending_many([first, second]) == 0
+    assert [draft["draft_id"] for draft in store.list()] == [other]
+    assert store.get(approved)["status"] == "approved"

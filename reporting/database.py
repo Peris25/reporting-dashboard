@@ -392,11 +392,16 @@ class DraftStore:
             return _draft_snapshot(session.get(DraftRequest, draft_id))
 
     def delete_pending(self, draft_id):
+        return self.delete_pending_many([draft_id]) == 1
+
+    def delete_pending_many(self, draft_ids):
+        if not draft_ids:
+            return 0
         with self.session_factory.begin() as session:
             deleted = session.execute(delete(DraftRequest).where(
-                DraftRequest.draft_id == draft_id, DraftRequest.status == "pending",
+                DraftRequest.draft_id.in_(draft_ids), DraftRequest.status == "pending",
             ))
-            return deleted.rowcount == 1
+            return deleted.rowcount
 
     def resolve(self, draft_id, *, status, reviewed_by="", review_note="", approved_ticket_id="", ticket=None):
         now = datetime.now().astimezone().isoformat(timespec="seconds")
