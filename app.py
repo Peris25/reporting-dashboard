@@ -19,6 +19,8 @@ from reporting.history import request_history
 from reporting.database import create_draft_store, create_user_store, database_handles
 from reporting.bootstrap import initialize_database
 from reporting.whatsapp import parse_export, parse_timestamp
+from reporting.workbook_import import import_it_tickets, read_it_workbook
+from sqlalchemy.exc import SQLAlchemyError
 from reporting.intake import extract_issues, DEFAULT_CATEGORIES
 from reporting.access import (
     CurrentUser, can_delete, can_manage, clean_subteam, hash_password, verify_password, visible_tickets,
@@ -550,6 +552,40 @@ def render_live_reporting():
     render_weekly_report(weekly_scope, refreshed_at)
 
 render_live_reporting()
+
+# ---- Historical IT workbook import ----
+if USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN:
+    with st.expander("Upload closed IT requests (.xlsx)"):
+        st.caption(
+            "Upload an IT Requests workbook, check the preview, and import directly into IT. "
+            "An external key can only be imported once. Dates without a timezone are Nairobi time."
+        )
+        if result := st.session_state.pop("it_workbook_result", None):
+            st.success(f"Created {result[0]} closed IT requests. Skipped {result[1]} existing keys.")
+        workbook = st.file_uploader("IT requests workbook", type=["xlsx"], key="it_workbook_import")
+        if workbook is not None:
+            try:
+                tickets = read_it_workbook(workbook.getvalue())
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.dataframe([
+                    {
+                        "External Key": ticket["external_key"], "Summary": ticket["summary"],
+                        "Assignee": ticket["assignee"], "Reported At": ticket["reported_at"],
+                        "Resolved At": ticket["resolved_at"], "Closed At": ticket["closed_at"],
+                        "Resolution Summary": ticket["resolution_summary"],
+                    }
+                    for ticket in tickets
+                ], width="stretch", hide_index=True)
+                if st.button(f"Import {len(tickets)} closed IT requests", type="primary"):
+                    try:
+                        count = import_it_tickets(ws.session_factory, tickets, actor=current_user.username)
+                    except SQLAlchemyError:
+                        st.error("The database could not import this workbook. No partial batch was saved.")
+                    else:
+                        st.session_state.it_workbook_result = (count, len(tickets) - count)
+                        st.rerun()
 
 # ---- Jira import ----
 with st.expander("Import and normalize Jira data"):
