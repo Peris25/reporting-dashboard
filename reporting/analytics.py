@@ -16,9 +16,13 @@ MILESTONES = [
 ]
 
 
+ALL_REQUESTERS_OPTION = "All tickets"
+
+
 def filter_requests(df, status="All statuses", priority="All priorities", month="All months",
                     owner="All agents", search="", department=ALL_DEPARTMENTS_OPTION,
-                    subteam=ALL_SUBTEAMS_OPTION):
+                    subteam=ALL_SUBTEAMS_OPTION, requester_type=ALL_REQUESTERS_OPTION,
+                    period_start=None, period_end=None):
     view = df.copy()
     for field, value, all_value in [
         ("Status", status, "All statuses"), ("Priority", priority, "All priorities"),
@@ -26,6 +30,17 @@ def filter_requests(df, status="All statuses", priority="All priorities", month=
     ]:
         if value != all_value:
             view = view.loc[view[field].eq(value)]
+    if requester_type and requester_type != ALL_REQUESTERS_OPTION:
+        kinds = view.get("Requester Type", "").fillna("").astype(str).str.strip()
+        view = view.loc[kinds.eq(requester_type)]
+    if (period_start is not None or period_end is not None) and "Reported_dt" in view.columns:
+        reported = pd.to_datetime(view["Reported_dt"], errors="coerce", utc=True).dt.tz_convert("Africa/Nairobi").dt.date
+        keep = reported.notna()
+        if period_start is not None:
+            keep &= reported.ge(period_start)
+        if period_end is not None:
+            keep &= reported.le(period_end)
+        view = view.loc[keep]
     if department != ALL_DEPARTMENTS_OPTION:
         assigned = view.get("Assigned Department", "").fillna("").astype(str).str.strip()
         view = view.loc[assigned.eq(department)]
