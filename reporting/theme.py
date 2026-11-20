@@ -33,7 +33,7 @@ def apply_solvit_theme():
         .st-key-sidebar_logout { position:fixed;left:18px;bottom:18px;z-index:9999;width:auto !important; }
         .st-key-sidebar_logout button { width:auto !important;min-height:34px !important;padding:.35rem .75rem !important;background:#FFF !important;font-size:.7rem !important;box-shadow:0 4px 14px rgba(15,23,42,.08) !important; }
         [data-testid="stSidebar"] hr { border-color: var(--solvit-border); }
-        .block-container { max-width: 1280px; padding-top: 2rem; padding-bottom: 4rem; }
+        .block-container { max-width: 1280px; padding-top: 3.4rem; padding-bottom: 4rem; }
         h1, h2, h3 { color: var(--solvit-text); letter-spacing: -0.025em; }
         h1 { font-weight: 800 !important; }
         h2, h3 { font-weight: 700 !important; }
@@ -91,9 +91,10 @@ def apply_solvit_theme():
         [data-baseweb="tab-highlight"] { background-color: var(--solvit-red) !important; }
         hr { border-color: var(--solvit-border) !important; }
         .solvit-brand {
-            display: flex; align-items: center; gap: 12px; margin: 0 0 1.4rem 0;
+            display: flex; align-items: center; gap: 18px; margin: 0 0 1.4rem 0;
             padding-bottom: 1rem; border-bottom: 1px solid var(--solvit-border);
         }
+        .solvit-brand > div { min-width: 0; }
         .dashboard-hero {
             position: relative; overflow: hidden; padding: 30px 34px; margin: 0 0 24px;
             border-radius: 22px; color: white;
