@@ -8,3 +8,5 @@ alembic>=1.14,<2
 altair>=5,<7
 openai>=1.40,<2
 requests>=2.31,<3
+openpyxl>=3.1,<4
+tzdata

@@ -65,3 +65,55 @@ def test_draft_store_roundtrip_and_resolve(tmp_path):
     approved = store.list("approved")
     assert approved[0]["approved_ticket_id"] == "t-1"
     assert approved[0]["reviewed_by"] == "alice@x"
+
+
+def test_delete_removes_only_pending_draft_without_a_reason():
+    store = create_draft_store("sqlite://")
+    pending = store.add({"summary": "Remove this draft"})
+    other = store.add({"summary": "Keep this draft"})
+    approved = store.add({"summary": "Keep this approved draft"})
+    assert store.resolve(approved, status="approved")
+    assert store.delete_pending(pending)
+    assert not store.delete_pending(pending)
+    assert not store.delete_pending(approved)
+    assert not store.resolve(pending, status="approved", ticket={})
+    assert store.get(pending) is None
+    assert [draft["draft_id"] for draft in store.list()] == [other]
+    assert store.get(approved)["status"] == "approved"
+
+
+def test_approval_saves_ticket_and_activity_before_draft_can_be_deleted():
+    from sqlalchemy import select
+
+    from reporting.database import Activity, Ticket
+
+    store = create_draft_store("sqlite://")
+    draft = store.add({"summary": "Example issue"})
+    ticket = {
+        "Ticket ID": "example-ticket", "Support Request Number": "SUP-EXAMPLE",
+        "Summary": "Example issue", "Description": "Example details",
+        "Status": "to do", "Created": "2026-01-01", "Updated At": "2026-01-01",
+        "Assigned Department": "IT",
+    }
+    assert store.resolve(
+        draft, status="approved", reviewed_by="test-admin",
+        approved_ticket_id=ticket["Ticket ID"], ticket=ticket,
+    )
+    assert not store.delete_pending(draft)
+    assert not store.resolve(draft, status="rejected")
+    with store.session_factory() as session:
+        saved = session.get(Ticket, "example-ticket")
+        assert saved.assigned_department == "IT"
+        actions = session.scalars(select(Activity.action).where(Activity.ticket_id == saved.ticket_id)).all()
+        assert set(actions) == {"support_request_created", "intake_approved"}
+
+
+def test_bulk_delete_skips_approved_missing_and_unselected_drafts():
+    store = create_draft_store("sqlite://")
+    first, second, other, approved = [store.add({"summary": str(i)}) for i in range(4)]
+    assert store.resolve(approved, status="approved")
+    assert store.delete_pending_many([]) == 0
+    assert store.delete_pending_many([first, second, first, approved, "missing"]) == 2
+    assert store.delete_pending_many([first, second]) == 0
+    assert [draft["draft_id"] for draft in store.list()] == [other]
+    assert store.get(approved)["status"] == "approved"

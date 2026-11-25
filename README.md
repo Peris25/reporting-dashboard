@@ -255,6 +255,14 @@ recreate accounts. Keep the old database until you have verified the copy.
 
 Open **Import and normalize Jira data**, upload the raw Jira CSV, inspect the preview, and then import. The importer supports Jira's repeated CSV headers, maps legacy statuses into the dashboard workflow, and generates a stable UUID from each Jira issue key. Uploading the same issues again will not duplicate them.
 
+Signed-in database admins can use **Upload closed IT requests (.xlsx)**. Use a sheet named
+`IT Requests` and include `External Key`, `Summary`, `Assignee`, `Status`, `Reported At`,
+`Resolved At`, `Closed At` and `Resolution Summary`. Use one stable external key per
+request and set the status to `closed`. Enter dates in Nairobi time. When a technical
+resolution time is unknown, leave `Resolved At` blank and explain the evidence in
+`Evidence Notes`. Review the preview and select **Import closed IT requests** to save the
+batch as tickets with an activity entry per new request. Existing keys are skipped.
+
 ## Tests
 
 Install development dependencies and run:
