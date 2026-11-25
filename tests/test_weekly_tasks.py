@@ -76,6 +76,26 @@ def test_backfill_sync_then_weekly_is_idempotent(tmp_path):
     assert len(store.list()) == 4
 
 
+def test_completion_stats_and_breakdowns():
+    from reporting.weekly_tracker import completion_by_department, completion_by_week, completion_stats
+    tasks = [
+        {"department": "IT", "week_start": "2026-10-05", "week_label": "WEEK 41", "status": "Complete"},
+        {"department": "IT", "week_start": "2026-10-05", "week_label": "WEEK 41", "status": "Off Track"},
+        {"department": "BD", "week_start": "2026-10-05", "week_label": "WEEK 41", "status": "Complete"},
+        {"department": "BD", "week_start": "2026-10-12", "week_label": "WEEK 42", "status": "Yet to Start"},
+    ]
+    stats = completion_stats(tasks)
+    assert stats["total"] == 4 and stats["complete"] == 2 and stats["off_track"] == 1
+    assert stats["rate"] == 50.0
+    by_dep = {row["department"]: row for row in completion_by_department(tasks)}
+    assert by_dep["IT"]["rate"] == 50.0 and by_dep["BD"]["complete"] == 1
+    trend = completion_by_week(tasks)
+    assert [row["week_start"] for row in trend] == ["2026-10-05", "2026-10-12"]  # oldest first
+    assert round(trend[0]["rate"], 1) == 66.7 and trend[1]["rate"] == 0.0  # 2 of 3, then 0 of 1
+    # An empty set is a safe zero, not a divide-by-zero.
+    assert completion_stats([])["rate"] == 0.0
+
+
 def test_routing_covers_only_mapped_kpis():
     assert "TAT" not in KPI_ROUTING and "Assessment Experience" not in KPI_ROUTING
     assert KPI_ROUTING["Comms Response"] == ("HR and Admin", "HR")
