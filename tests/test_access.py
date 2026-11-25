@@ -9,8 +9,8 @@ from reporting.access import (
 
 def make_df():
     return pd.DataFrame([
-        {"Ticket ID": "1", "Assigned Department": "IT", "Reporting Department": "HR"},
-        {"Ticket ID": "2", "Assigned Department": "HR", "Reporting Department": "HR"},
+        {"Ticket ID": "1", "Assigned Department": "IT", "Reporting Department": "HR and Admin"},
+        {"Ticket ID": "2", "Assigned Department": "HR and Admin", "Reporting Department": "HR and Admin"},
         {"Ticket ID": "3", "Assigned Department": "Operations", "Reporting Department": "BD"},
         {"Ticket ID": "4", "Assigned Department": "BD", "Reporting Department": "IT"},
     ])
@@ -40,8 +40,8 @@ def test_admin_sees_everything():
 
 
 def test_member_sees_assigned_and_reported():
-    hr = visible_tickets(make_df(), department="HR", admin=False)
-    # HR owns ticket 2 and raised ticket 1.
+    hr = visible_tickets(make_df(), department="HR and Admin", admin=False)
+    # HR and Admin owns ticket 2 and raised ticket 1.
     assert set(hr["Ticket ID"]) == {"1", "2"}
 
 

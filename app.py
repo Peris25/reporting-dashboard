@@ -17,12 +17,15 @@ from reporting.views import render_department_breakdown, render_reporting_views,
 from reporting.analytics import ALL_REQUESTERS_OPTION, filter_requests, milestone_deadlines
 from reporting.workflow import can_transition
 from reporting.history import request_history
-from reporting.database import DraftStore, create_user_store, database_handles
+from reporting.database import DraftStore, create_user_store, create_weekly_task_store, database_handles
 from reporting.bootstrap import initialize_database
 from reporting.whatsapp import parse_export, parse_timestamp
 from reporting.workbook_import import import_it_tickets, read_it_workbook
 from sqlalchemy.exc import SQLAlchemyError
 from reporting.intake import extract_issues, DEFAULT_CATEGORIES
+from reporting.graph_excel import GraphConfig
+from reporting.weekly_sync import sync_weekly_tasks, DEFAULT_WORKSHEET
+from reporting.weekly_tracker import STATUSES as WEEKLY_STATUSES
 from reporting.access import (
     CurrentUser, can_delete, can_manage, clean_subteam, hash_password, verify_password, visible_tickets,
 )
@@ -66,6 +69,9 @@ BOOTSTRAP_ADMIN_PASSWORD = setting("DASHBOARD_ADMIN_PASSWORD")
 # without one it falls back to a single heuristic draft.
 OPENAI_API_KEY = setting("OPENAI_API_KEY")
 OPENAI_MODEL = setting("OPENAI_MODEL", "gpt-4o-mini")
+# Weekly Manager Tracker (read live via Microsoft Graph).
+TRACKER_SHARE_URL = setting("TRACKER_SHARE_URL")
+TRACKER_WORKSHEET = setting("TRACKER_WORKSHEET", DEFAULT_WORKSHEET)
 
 REQUIRED_HEADERS = TICKET_HEADERS
 INTAKE_CATEGORIES = DEFAULT_CATEGORIES
@@ -292,6 +298,12 @@ def require_login():
 def get_user_store():
     configured_url = setting("DATABASE_URL")
     return create_user_store(configured_url or None)
+
+
+@st.cache_resource
+def get_weekly_task_store():
+    configured_url = setting("DATABASE_URL")
+    return create_weekly_task_store(configured_url or None)
 
 
 def current_user_from(account):
@@ -670,8 +682,8 @@ def render_live_reporting():
 
 
 # ---- Tabbed layout ----
-tab_overview, tab_tickets, tab_new, tab_reports, tab_admin = st.tabs(
-    ["Overview", "Tickets", "New request", "Reports", "Admin"]
+tab_overview, tab_tickets, tab_new, tab_reports, tab_weekly, tab_admin = st.tabs(
+    ["Overview", "Tickets", "New request", "Reports", "Weekly tasks", "Admin"]
 )
 
 with tab_overview:
@@ -679,6 +691,77 @@ with tab_overview:
 
 with tab_reports:
     render_live_reporting()
+
+with tab_weekly:
+    # Actions from the Weekly Manager Tracker, due at the Thursday review meeting.
+    # Tracked separately from support requests so they never affect SLA metrics.
+    st.subheader("Weekly tasks")
+    st.caption(
+        "Actions from the Weekly Manager Tracker, due at the Thursday review meeting. "
+        "Tracked separately from support requests, so they never affect the SLA metrics."
+    )
+    if not USE_DATABASE:
+        st.info("Weekly tasks require the PostgreSQL database backend.")
+    else:
+        weekly_store = get_weekly_task_store()
+        if view_all_user:
+            weekly_graph = GraphConfig.from_settings(setting)
+            weekly_ready = weekly_graph.is_configured() and bool(TRACKER_SHARE_URL)
+            sync_col, hint_col = st.columns([1, 2])
+            if sync_col.button("Sync weekly tasks", disabled=not weekly_ready, key="sync_weekly"):
+                try:
+                    with st.spinner("Reading the tracker and updating weekly tasks…"):
+                        weekly_summary = sync_weekly_tasks(
+                            weekly_store, graph_config=weekly_graph,
+                            share_url=TRACKER_SHARE_URL, worksheet=TRACKER_WORKSHEET,
+                        )
+                    if weekly_summary["tasks"]:
+                        st.success(
+                            f"{weekly_summary['week']} (due {weekly_summary['due']}): "
+                            f"{weekly_summary['created']} new, {weekly_summary['updated']} updated."
+                        )
+                    else:
+                        st.info("No tasks are filled in for the active week yet.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Sync failed: {error}")
+            if not weekly_ready:
+                hint_col.caption("Set the MS_* Graph secrets and TRACKER_SHARE_URL to enable live sync.")
+
+        weekly_weeks = weekly_store.weeks()
+        if not weekly_weeks:
+            st.caption("No weekly tasks yet. An admin can sync them from the tracker.")
+        else:
+            current_week = weekly_weeks[0]
+            week_tasks = weekly_store.list(week_start=current_week)
+            visible_tasks = [
+                task for task in week_tasks
+                if view_all_user or normalize_department(task["department"]) == current_user.department
+            ]
+            label = week_tasks[0]["week_label"] or current_week
+            due = week_tasks[0]["due_at"] or ""
+            done = sum(1 for task in visible_tasks if task["status"] == WEEKLY_STATUSES[-1])
+            st.caption(f"{label}  ·  due {due}  ·  {done}/{len(visible_tasks)} complete in your view")
+            if not visible_tasks:
+                st.caption("No weekly tasks routed to your department this week.")
+            for task in visible_tasks:
+                with st.container(border=True):
+                    heading = f"**{task['kpi_area']}**  ·  {task['department'] or 'Unrouted'}"
+                    if task["subteam"]:
+                        heading += f" / {task['subteam']}"
+                    st.markdown(heading)
+                    st.write(task["task"])
+                    if task["comments"]:
+                        st.caption(f"Notes from the tracker: {task['comments']}")
+                    can_edit_task = view_all_user or normalize_department(task["department"]) == current_user.department
+                    status_value = task["status"] if task["status"] in WEEKLY_STATUSES else WEEKLY_STATUSES[0]
+                    new_status = st.selectbox(
+                        "Status", WEEKLY_STATUSES, index=WEEKLY_STATUSES.index(status_value),
+                        key=f"weekly_status_{task['task_id']}", disabled=not can_edit_task,
+                    )
+                    if can_edit_task and new_status != task["status"]:
+                        weekly_store.set_status(task["task_id"], new_status)
+                        st.rerun()
 
 with tab_tickets:
     editor_df = view.copy()
