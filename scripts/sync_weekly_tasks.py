@@ -11,7 +11,8 @@ Environment variables:
     TRACKER_WORKSHEET    worksheet/tab name (default "Weekly Manager Tracker")
 
 Usage:
-    python scripts/sync_weekly_tasks.py
+    python scripts/sync_weekly_tasks.py          # sync the active week
+    python scripts/sync_weekly_tasks.py --all     # one-time backfill of every week
 """
 import os
 import sys
@@ -32,16 +33,19 @@ def main():
     if not graph_config.is_configured():
         print("Set MS_TENANT_ID, MS_CLIENT_ID, and MS_CLIENT_SECRET for Graph access.")
         return 1
+    all_weeks = "--all" in sys.argv[1:]
     store = create_weekly_task_store(os.getenv("DATABASE_URL") or None)
     summary = sync_weekly_tasks(
         store, graph_config=graph_config, share_url=share_url,
         worksheet=os.getenv("TRACKER_WORKSHEET", DEFAULT_WORKSHEET),
+        all_weeks=all_weeks,
     )
     if not summary["tasks"]:
-        print("No tasks found for the active week yet.")
+        print("No tasks found in the tracker yet." if all_weeks
+              else "No tasks found for the active week yet.")
         return 0
-    print(f"Synced {summary['week']} (due {summary['due']}): "
-          f"{summary['created']} created, {summary['updated']} updated.")
+    scope = f"{summary['weeks']} week(s)" if all_weeks else f"{summary['week']} (due {summary['due']})"
+    print(f"Synced {scope}: {summary['created']} created, {summary['updated']} updated.")
     return 0
 
 
