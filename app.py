@@ -707,38 +707,56 @@ with tab_weekly:
         if view_all_user:
             weekly_graph = GraphConfig.from_settings(setting)
             weekly_ready = weekly_graph.is_configured() and bool(TRACKER_SHARE_URL)
+            backfill = st.checkbox(
+                "Import all weeks (one-time backfill)", key="weekly_backfill",
+                help="Fetch every filled week from the tracker, not just the current one. "
+                     "Use this once to load history; after that the weekly sync keeps up.",
+            )
             sync_col, hint_col = st.columns([1, 2])
-            if sync_col.button("Sync weekly tasks", disabled=not weekly_ready, key="sync_weekly"):
+            sync_label = "Import all weeks" if backfill else "Sync weekly tasks"
+            if sync_col.button(sync_label, disabled=not weekly_ready, key="sync_weekly"):
                 try:
                     with st.spinner("Reading the tracker and updating weekly tasks…"):
                         weekly_summary = sync_weekly_tasks(
                             weekly_store, graph_config=weekly_graph,
                             share_url=TRACKER_SHARE_URL, worksheet=TRACKER_WORKSHEET,
+                            all_weeks=backfill,
                         )
                     if weekly_summary["tasks"]:
-                        st.success(
-                            f"{weekly_summary['week']} (due {weekly_summary['due']}): "
-                            f"{weekly_summary['created']} new, {weekly_summary['updated']} updated."
+                        scope = (
+                            f"{weekly_summary['weeks']} week(s)" if backfill
+                            else f"{weekly_summary['week']} (due {weekly_summary['due']})"
                         )
+                        st.success(f"{scope}: {weekly_summary['created']} new, {weekly_summary['updated']} updated.")
+                        st.rerun()
                     else:
-                        st.info("No tasks are filled in for the active week yet.")
-                    st.rerun()
+                        st.error(
+                            "Nothing to fetch: the tracker has no tasks filled in "
+                            + ("for any week yet." if backfill else "for this week yet.")
+                        )
                 except Exception as error:
                     st.error(f"Sync failed: {error}")
             if not weekly_ready:
                 hint_col.caption("Set the MS_* Graph secrets and TRACKER_SHARE_URL to enable live sync.")
 
-        weekly_weeks = weekly_store.weeks()
-        if not weekly_weeks:
+        all_weekly = weekly_store.list()
+        if not all_weekly:
             st.caption("No weekly tasks yet. An admin can sync them from the tracker.")
         else:
-            current_week = weekly_weeks[0]
-            week_tasks = weekly_store.list(week_start=current_week)
+            # The store returns every week, newest first; let the user browse any of them.
+            week_labels = {}
+            for task in all_weekly:
+                week_labels.setdefault(task["week_start"], task["week_label"] or task["week_start"])
+            week_options = list(week_labels)
+            picked_week = st.selectbox(
+                "Week", week_options, format_func=lambda w: week_labels[w], key="weekly_week_pick",
+            )
+            week_tasks = [task for task in all_weekly if task["week_start"] == picked_week]
             visible_tasks = [
                 task for task in week_tasks
                 if view_all_user or normalize_department(task["department"]) == current_user.department
             ]
-            label = week_tasks[0]["week_label"] or current_week
+            label = week_tasks[0]["week_label"] or picked_week
             due = week_tasks[0]["due_at"] or ""
             done = sum(1 for task in visible_tasks if task["status"] == WEEKLY_STATUSES[-1])
             st.caption(f"{label}  ·  due {due}  ·  {done}/{len(visible_tasks)} complete in your view")

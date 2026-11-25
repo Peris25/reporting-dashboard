@@ -155,6 +155,33 @@ def _cell(row, index):
     return _clean(row[index]) if index < len(row) else ""
 
 
+def _task_record(kpi_area, row, col, label, start, end, due_at):
+    """Build one normalized task dict, or None when the week's cell is empty."""
+    task = _cell(row, col)
+    if not task:
+        return None
+    department, subteam = KPI_ROUTING[kpi_area]
+    department = normalize_department(department)
+    return {
+        "kpi_area": kpi_area,
+        "department": department,
+        "subteam": normalize_subteam(department, subteam),
+        "week_label": label,
+        "week_start": start.isoformat(),
+        "week_end": end.isoformat(),
+        "due_at": due_at.isoformat(),
+        "task": task,
+        "comments": _cell(row, col + 2),
+        "status": normalize_status(_cell(row, col + 1)) or "Yet to Start",
+        "source_key": f"{start.isoformat()}|{kpi_area}",
+    }
+
+
+def week_due_date(week_end):
+    """The Thursday meeting a week's tasks are due at: the second after it ends."""
+    return next_thursday(week_end) + dt.timedelta(days=7)
+
+
 def build_weekly_tasks(grid, now=None, base_year=None):
     """Return normalized weekly-task dicts for the currently active week."""
     now = now or dt.date.today()
@@ -171,25 +198,34 @@ def build_weekly_tasks(grid, now=None, base_year=None):
     rows = kpi_rows(grid, header_index)
     tasks = []
     for kpi_area, row_index in rows.items():
-        row = grid[row_index]
-        task = _cell(row, col)
-        if not task:
-            continue
-        department, subteam = KPI_ROUTING[kpi_area]
-        department = normalize_department(department)
-        tasks.append({
-            "kpi_area": kpi_area,
-            "department": department,
-            "subteam": normalize_subteam(department, subteam),
-            "week_label": label,
-            "week_start": start.isoformat(),
-            "week_end": end.isoformat(),
-            "due_at": due_at.isoformat(),
-            "task": task,
-            "comments": _cell(row, col + 2),
-            "status": normalize_status(_cell(row, col + 1)) or "Yet to Start",
-            "source_key": f"{start.isoformat()}|{kpi_area}",
-        })
+        record = _task_record(kpi_area, grid[row_index], col, label, start, end, due_at)
+        if record is not None:
+            tasks.append(record)
+    return tasks
+
+
+def build_all_weekly_tasks(grid, now=None, base_year=None):
+    """Return task dicts for EVERY filled week in the tracker (one-time backfill).
+
+    Unlike build_weekly_tasks, this ignores the active-week cadence and imports
+    every week block that has tasks, each with its own due date. Intended for a
+    first import so past weeks are visible; the weekly sync then keeps up.
+    """
+    now = now or dt.date.today()
+    header_index = find_section2_header(grid)
+    if header_index is None:
+        return []
+    if base_year is None:
+        base_year = _infer_year(grid, now)
+    weeks = week_columns(grid[header_index], base_year)
+    rows = kpi_rows(grid, header_index)
+    tasks = []
+    for col, label, start, end in weeks:
+        due_at = week_due_date(end)
+        for kpi_area, row_index in rows.items():
+            record = _task_record(kpi_area, grid[row_index], col, label, start, end, due_at)
+            if record is not None:
+                tasks.append(record)
     return tasks
 
 

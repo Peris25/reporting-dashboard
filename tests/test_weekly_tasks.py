@@ -3,7 +3,8 @@ import datetime as dt
 from reporting.database import create_weekly_task_store
 from reporting.weekly_sync import sync_weekly_tasks
 from reporting.weekly_tracker import (
-    KPI_ROUTING, active_week, build_weekly_tasks, next_thursday, parse_week_label, week_columns,
+    KPI_ROUTING, active_week, build_all_weekly_tasks, build_weekly_tasks, next_thursday,
+    parse_week_label, week_columns, week_due_date,
 )
 
 GRID = [
@@ -50,6 +51,29 @@ def test_build_weekly_tasks_routes_and_skips_unmapped():
     assert by_kpi["Administration"]["department"] == "HR and Admin"
     assert by_kpi["Administration"]["subteam"] == "Admin"
     assert by_kpi["Administration"]["status"] == "Yet to Start"  # blank defaults
+
+
+def test_build_all_weekly_tasks_imports_every_filled_week():
+    tasks = build_all_weekly_tasks(GRID, now=dt.date(2026, 10, 21))
+    # WEEK 41 has three filled rows; WEEK 42 has only Requests ("Next week BD").
+    weeks = {t["week_start"] for t in tasks}
+    assert weeks == {"2026-10-05", "2026-10-12"}
+    assert len(tasks) == 4
+    wk42 = [t for t in tasks if t["week_start"] == "2026-10-12"]
+    assert [t["kpi_area"] for t in wk42] == ["Requests"]
+    assert wk42[0]["task"] == "Next week BD"
+    # Each week carries its own due date (the second Thursday after it ends).
+    assert wk42[0]["due_at"] == week_due_date(dt.date(2026, 10, 18)).isoformat()
+
+
+def test_backfill_sync_then_weekly_is_idempotent(tmp_path):
+    store = create_weekly_task_store(f"sqlite:///{tmp_path / 'weekly.db'}")
+    backfill = sync_weekly_tasks(store, grid=GRID, now=dt.date(2026, 10, 21), all_weeks=True)
+    assert backfill["tasks"] == 4 and backfill["created"] == 4 and backfill["weeks"] == 2
+    # A later normal weekly sync refreshes the active week without duplicating it.
+    weekly = sync_weekly_tasks(store, grid=GRID, now=dt.date(2026, 10, 21))
+    assert weekly["created"] == 0 and weekly["updated"] == 3
+    assert len(store.list()) == 4
 
 
 def test_routing_covers_only_mapped_kpis():
