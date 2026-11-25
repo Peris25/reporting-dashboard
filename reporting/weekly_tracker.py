@@ -229,6 +229,52 @@ def build_all_weekly_tasks(grid, now=None, base_year=None):
     return tasks
 
 
+def completion_stats(tasks):
+    """Counts and the Complete-over-total completion rate for a set of tasks."""
+    counts = {status: 0 for status in STATUSES}
+    for task in tasks:
+        status = task.get("status")
+        counts[status if status in counts else STATUSES[0]] += 1
+    total = len(tasks)
+    complete = counts[DONE_STATUS]
+    return {
+        "total": total,
+        "complete": complete,
+        "on_track": counts["On Track"],
+        "off_track": counts["Off Track"],
+        "not_started": counts["Yet to Start"],
+        "rate": (complete / total * 100) if total else 0.0,
+    }
+
+
+def completion_by_department(tasks):
+    """Per-department completion rows, sorted by department name."""
+    groups = {}
+    for task in tasks:
+        groups.setdefault(task.get("department") or "Unrouted", []).append(task)
+    rows = []
+    for department, items in groups.items():
+        stats = completion_stats(items)
+        rows.append({"department": department, "total": stats["total"],
+                     "complete": stats["complete"], "rate": stats["rate"]})
+    return sorted(rows, key=lambda row: row["department"])
+
+
+def completion_by_week(tasks):
+    """Per-week completion rows, oldest week first, for a completion trend."""
+    groups, labels = {}, {}
+    for task in tasks:
+        week = task.get("week_start")
+        groups.setdefault(week, []).append(task)
+        labels.setdefault(week, task.get("week_label") or week)
+    rows = []
+    for week, items in groups.items():
+        stats = completion_stats(items)
+        rows.append({"week_start": week, "week_label": labels[week], "total": stats["total"],
+                     "complete": stats["complete"], "rate": stats["rate"]})
+    return sorted(rows, key=lambda row: row["week_start"] or "")
+
+
 def _infer_year(grid, now):
     for row in grid[:3]:
         for cell in row:

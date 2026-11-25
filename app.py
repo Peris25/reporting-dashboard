@@ -25,7 +25,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from reporting.intake import extract_issues, DEFAULT_CATEGORIES
 from reporting.graph_excel import GraphConfig
 from reporting.weekly_sync import sync_weekly_tasks, DEFAULT_WORKSHEET
-from reporting.weekly_tracker import STATUSES as WEEKLY_STATUSES
+from reporting.weekly_tracker import (
+    STATUSES as WEEKLY_STATUSES, completion_by_department, completion_by_week, completion_stats,
+)
 from reporting.access import (
     CurrentUser, can_delete, can_manage, clean_subteam, hash_password, verify_password, visible_tickets,
 )
@@ -762,6 +764,77 @@ with tab_weekly:
             st.caption(f"{label}  ·  due {due}  ·  {done}/{len(visible_tasks)} complete in your view")
             if not visible_tasks:
                 st.caption("No weekly tasks routed to your department this week.")
+            else:
+                # Weekly tasks get their own analysis, kept apart from ticket SLA metrics.
+                stats = completion_stats(visible_tasks)
+                render_kpi_cards([
+                    ("Completion rate", f"{stats['rate']:.0f}%", "Complete ÷ tasks this week", "#10B981"),
+                    ("Complete", stats["complete"], f"of {stats['total']} tasks", "#3B82F6"),
+                    ("Off track", stats["off_track"], "Flagged at risk", "#ff353e"),
+                    ("Not started", stats["not_started"], "Yet to begin", "#F59E0B"),
+                ])
+                visible_all_weekly = [
+                    task for task in all_weekly
+                    if view_all_user or normalize_department(task["department"]) == current_user.department
+                ]
+                analysis_cols = st.columns(2)
+                with analysis_cols[0]:
+                    if view_all_user:
+                        st.markdown("###### Completion by department")
+                        dep_data = [
+                            {"Department": row["department"], "Completion %": round(row["rate"], 1),
+                             "Complete": row["complete"], "Total": row["total"]}
+                            for row in completion_by_department(week_tasks)
+                        ]
+                        st.altair_chart(
+                            alt.Chart(alt.Data(values=dep_data)).mark_bar(cornerRadiusEnd=4).encode(
+                                x=alt.X("Completion %:Q", scale=alt.Scale(domain=[0, 100])),
+                                y=alt.Y("Department:N", sort="-x", title=None),
+                                color=alt.value("#3B82F6"),
+                                tooltip=["Department:N", "Completion %:Q", "Complete:Q", "Total:Q"],
+                            ).properties(height=max(140, 34 * len(dep_data))).configure_view(strokeWidth=0),
+                            width="stretch",
+                        )
+                    else:
+                        st.markdown("###### Status mix")
+                        mix = [
+                            {"Status": status, "Tasks": sum(
+                                1 for task in visible_tasks
+                                if (task["status"] if task["status"] in WEEKLY_STATUSES else WEEKLY_STATUSES[0]) == status)}
+                            for status in WEEKLY_STATUSES
+                        ]
+                        st.altair_chart(
+                            alt.Chart(alt.Data(values=mix)).mark_arc(innerRadius=55).encode(
+                                theta="Tasks:Q",
+                                color=alt.Color("Status:N", scale=alt.Scale(
+                                    domain=WEEKLY_STATUSES, range=["#F59E0B", "#3B82F6", "#ff353e", "#10B981"]),
+                                    legend=alt.Legend(title=None, orient="bottom")),
+                                tooltip=["Status:N", "Tasks:Q"],
+                            ).properties(height=240).configure_view(strokeWidth=0),
+                            width="stretch",
+                        )
+                with analysis_cols[1]:
+                    st.markdown("###### Completion rate over weeks")
+                    trend = completion_by_week(visible_all_weekly)
+                    if len(trend) < 2:
+                        st.caption("Backfill more weeks to see a trend.")
+                    else:
+                        order = [row["week_label"] for row in trend]
+                        trend_data = [
+                            {"Week": row["week_label"], "Completion %": round(row["rate"], 1),
+                             "Complete": row["complete"], "Total": row["total"]}
+                            for row in trend
+                        ]
+                        st.altair_chart(
+                            alt.Chart(alt.Data(values=trend_data)).mark_line(point=True).encode(
+                                x=alt.X("Week:N", sort=order, title=None),
+                                y=alt.Y("Completion %:Q", scale=alt.Scale(domain=[0, 100])),
+                                color=alt.value("#10B981"),
+                                tooltip=["Week:N", "Completion %:Q", "Complete:Q", "Total:Q"],
+                            ).properties(height=240).configure_view(strokeWidth=0),
+                            width="stretch",
+                        )
+                st.divider()
             for task in visible_tasks:
                 with st.container(border=True):
                     heading = f"**{task['kpi_area']}**  ·  {task['department'] or 'Unrouted'}"
