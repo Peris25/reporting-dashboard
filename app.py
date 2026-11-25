@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ from reporting.jira import import_summary, normalize_jira_csv
 from reporting.schema import ACTIVITY_HEADERS, STATUSES, TICKET_HEADERS
 from reporting.sla import enrich_tickets, format_duration, overdue_milestones, reported_time
 from reporting.views import render_department_breakdown, render_reporting_views, render_weekly_report
-from reporting.analytics import filter_requests, milestone_deadlines
+from reporting.analytics import ALL_REQUESTERS_OPTION, filter_requests, milestone_deadlines
 from reporting.workflow import can_transition
 from reporting.history import request_history
 from reporting.database import DraftStore, create_user_store, database_handles
@@ -381,6 +382,53 @@ def normalize_department_columns(frame):
     return frame
 
 
+# ---- Shared presentation helpers ----
+def within_pct(series):
+    """Percentage of recorded milestones that met their SLA target."""
+    measured = series.isin(["Within SLA", "Breached"])
+    if not measured.any():
+        return "—"
+    return f"{100 * series[measured].eq('Within SLA').mean():.0f}%"
+
+
+def _weekly_counts(series, status_mask=None):
+    stamps = pd.to_datetime(series, errors="coerce", utc=True)
+    if status_mask is not None:
+        stamps = stamps[status_mask.values]
+    stamps = stamps.dropna().dt.tz_convert("Africa/Nairobi").dt.tz_localize(None).dt.to_period("W").dt.start_time
+    return stamps.value_counts().sort_index()
+
+
+def received_resolved_chart(view, weeks=10):
+    received = _weekly_counts(view["Reported_dt"])
+    resolved = _weekly_counts(view["Closed At"], view["Status"].eq("closed"))
+    all_weeks = sorted(set(received.index) | set(resolved.index))[-weeks:]
+    order = [pd.Timestamp(w).strftime("%d %b") for w in all_weeks]
+    rows = []
+    for week in all_weeks:
+        label = pd.Timestamp(week).strftime("%d %b")
+        rows.append({"Week starting": label, "Series": "Received", "Tickets": int(received.get(week, 0))})
+        rows.append({"Week starting": label, "Series": "Resolved", "Tickets": int(resolved.get(week, 0))})
+    return alt.Chart(alt.Data(values=rows)).mark_line(point=True).encode(
+        x=alt.X("Week starting:N", sort=order, title="Week starting"),
+        y=alt.Y("Tickets:Q", title="Tickets", axis=alt.Axis(tickMinStep=1)),
+        color=alt.Color("Series:N", scale=alt.Scale(domain=["Received", "Resolved"], range=["#3B82F6", "#10B981"]),
+                        legend=alt.Legend(title=None, orient="bottom")),
+        tooltip=["Week starting:N", "Series:N", "Tickets:Q"],
+    ).properties(height=260).configure_view(strokeWidth=0)
+
+
+def status_donut(view):
+    closed = int(view["Status"].eq("closed").sum())
+    values = [{"Status": "Open", "Tickets": len(view) - closed}, {"Status": "Resolved", "Tickets": closed}]
+    return alt.Chart(alt.Data(values=values)).mark_arc(innerRadius=60).encode(
+        theta=alt.Theta("Tickets:Q"),
+        color=alt.Color("Status:N", scale=alt.Scale(domain=["Open", "Resolved"], range=["#3B82F6", "#10B981"]),
+                        legend=alt.Legend(title=None, orient="bottom")),
+        tooltip=["Status:N", "Tickets:Q"],
+    ).properties(height=260).configure_view(strokeWidth=0)
+
+
 # ---- App ----
 ws, activity_ws = get_sheet_handles()
 ensure_headers(ws, REQUIRED_HEADERS)
@@ -440,6 +488,33 @@ st.sidebar.caption(
     + access_note
 )
 
+# Ticket workspace filters by who reported the request (requester type).
+WORKSPACES = [ALL_REQUESTERS_OPTION, "Solver", "Solvit Office Team", "External Clients"]
+_WORKSPACE_PRETTY = {ALL_REQUESTERS_OPTION: "All tickets", "Solver": "Solver tickets",
+                     "Solvit Office Team": "Solvit Office Team", "External Clients": "External clients"}
+_requester_kinds = scoped_df.get("Requester Type", "").fillna("").astype(str).str.strip()
+
+
+def _workspace_label(option):
+    count = len(scoped_df) if option == ALL_REQUESTERS_OPTION else int(_requester_kinds.eq(option).sum())
+    return f"{_WORKSPACE_PRETTY[option]} ({count})"
+
+
+workspace = st.sidebar.radio("Ticket workspace", WORKSPACES, format_func=_workspace_label, key="workspace")
+
+# Reporting period narrows everything to requests reported in the window.
+_PERIODS = {"All time": None, "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90, "This year": "year"}
+period_label = st.sidebar.selectbox("Reporting period", list(_PERIODS))
+_today = pd.Timestamp.now(tz="Africa/Nairobi").date()
+if _PERIODS[period_label] == "year":
+    period_start, period_end = _today.replace(month=1, day=1), _today
+elif isinstance(_PERIODS[period_label], int):
+    period_start, period_end = _today - timedelta(days=_PERIODS[period_label]), _today
+else:
+    period_start, period_end = None, None
+
+status_filter = st.sidebar.selectbox("Request status", ["All statuses"] + STATUSES)
+
 # Users with the global view can scope the whole dashboard to one department;
 # department members are already scoped to their own, so this filter is hidden.
 if view_all_user:
@@ -451,19 +526,18 @@ else:
 effective_department = department_filter if view_all_user else current_user.department
 subteam_options = subteams_for(effective_department) if effective_department != ALL_DEPARTMENTS_OPTION else []
 if subteam_options:
-    subteam_filter = st.sidebar.selectbox("Operations sub-team", [ALL_SUBTEAMS_OPTION] + subteam_options)
+    subteam_filter = st.sidebar.selectbox("Sub-team", [ALL_SUBTEAMS_OPTION] + subteam_options)
 else:
     subteam_filter = ALL_SUBTEAMS_OPTION
 
-status_filter = st.sidebar.selectbox("Request status", ["All statuses"] + STATUSES)
-
-priorities = sorted([p for p in scoped_df["Priority"].dropna().unique() if str(p).strip() != ""])
-priority_filter = st.sidebar.selectbox("Priority", ["All priorities"] + priorities) if priorities else "All priorities"
-
-months = sorted([m for m in scoped_df["Created Month"].dropna().unique() if m != "NaT"])
-month_filter = st.sidebar.selectbox("Created month", ["All months"] + months) if months else "All months"
-agents = sorted({str(value).strip() for value in scoped_df["Assignee"].fillna("") if str(value).strip()})
-owner_filter = st.sidebar.selectbox("Assigned agent", ["All agents", "Unassigned"] + agents)
+with st.sidebar.expander("More filters"):
+    priorities = sorted([p for p in scoped_df["Priority"].dropna().unique() if str(p).strip() != ""])
+    priority_filter = st.selectbox("Priority", ["All priorities"] + priorities) if priorities else "All priorities"
+    months = sorted([m for m in scoped_df["Created Month"].dropna().unique() if m != "NaT"])
+    month_filter = st.selectbox("Created month", ["All months"] + months) if months else "All months"
+    agents = sorted({str(value).strip() for value in scoped_df["Assignee"].fillna("") if str(value).strip()})
+    owner_filter = st.selectbox("Assigned agent", ["All agents", "Unassigned"] + agents)
+    search = st.text_input("Search", placeholder="Support number, Reg No, Job ID, requester, summary, or agent")
 
 render_sidebar_footer()
 if st.sidebar.button("Sign out", icon=":material/logout:", key="sidebar_logout"):
@@ -471,12 +545,15 @@ if st.sidebar.button("Sign out", icon=":material/logout:", key="sidebar_logout")
         st.session_state.pop(key, None)
     st.rerun()
 
-search = st.text_input("Search support requests", placeholder="Support number, Reg No, Job Request ID, requester, summary, department, or agent")
-view = filter_requests(scoped_df, status_filter, priority_filter, month_filter, owner_filter, search, department_filter, subteam_filter)
+view = filter_requests(
+    scoped_df, status_filter, priority_filter, month_filter, owner_filter, search,
+    department_filter, subteam_filter, requester_type=workspace,
+    period_start=period_start, period_end=period_end,
+)
 
-@st.fragment(run_every="10m")
-def render_live_reporting():
-    st.button("Refresh analytics now", key="refresh_analytics")
+
+def _live_view():
+    """Re-read and filter the data the same way, for the auto-refreshing tabs."""
     refreshed_at = pd.Timestamp.now(tz="UTC")
     fresh = read_df(ws, REQUIRED_HEADERS)
     for field in ["Status", "Summary", "Priority", "Assignee"]:
@@ -484,7 +561,53 @@ def render_live_reporting():
     fresh["Status"] = fresh["Status"].str.lower()
     live_df = normalize_department_columns(enrich_tickets(fresh, now=refreshed_at))
     live_role = visible_tickets(live_df, department=current_user.department, admin=view_all_user)
-    live_view = filter_requests(live_role, status_filter, priority_filter, month_filter, owner_filter, search, department_filter, subteam_filter)
+    live_view = filter_requests(
+        live_role, status_filter, priority_filter, month_filter, owner_filter, search,
+        department_filter, subteam_filter, requester_type=workspace,
+        period_start=period_start, period_end=period_end,
+    )
+    return refreshed_at, live_role, live_view
+
+
+@st.fragment(run_every="10m")
+def render_overview():
+    st.button("Refresh overview", key="refresh_overview")
+    refreshed_at, _live_role, live_view = _live_view()
+    closed_mask = live_view["Status"].eq("closed")
+    open_df = live_view.loc[~closed_mask]
+    overdue = overdue_milestones(open_df).any(axis=1) if len(open_df) else pd.Series(dtype=bool)
+    unassigned = open_df["Assignee"].fillna("").astype(str).str.strip().eq("") if len(open_df) else pd.Series(dtype=bool)
+    render_kpi_cards([
+        ("Tickets in period", len(live_view), "Matches the current filters", "#3B82F6"),
+        ("Open", int((~closed_mask).sum()), "Awaiting resolution", "#F59E0B"),
+        ("Resolved", int(closed_mask.sum()), "Closed in view", "#10B981"),
+        ("Overdue", int(overdue.sum()) if len(open_df) else 0, "Past an SLA target", "#ff353e"),
+        ("Unassigned", int(unassigned.sum()) if len(open_df) else 0, "No owner yet", "#8B5CF6"),
+    ])
+    render_kpi_cards([
+        ("Response within 30 min", within_pct(live_view["Response SLA"]), "Of recorded first responses", "#3B82F6"),
+        ("Resolution within 48 h", within_pct(live_view["Closure SLA"]), "Of recorded closures", "#10B981"),
+        ("Average resolution", format_duration(live_view.loc[closed_mask, "Closure Hours"].mean()), "Reported to closed", "#8B5CF6"),
+        ("Needs attention", int((overdue | unassigned).sum()) if len(open_df) else 0, "Overdue or unassigned", "#ff353e"),
+    ])
+    st.divider()
+    if live_view.empty:
+        st.info("No requests match the current filters.")
+    else:
+        left, right = st.columns([1.6, 1])
+        with left:
+            st.markdown("#### Requests received and resolved")
+            st.altair_chart(received_resolved_chart(live_view), width="stretch")
+        with right:
+            st.markdown("#### Ticket status")
+            st.altair_chart(status_donut(live_view), width="stretch")
+    st.caption(f"Auto-refreshes every 10 minutes. Last updated {refreshed_at.tz_convert('Africa/Nairobi'):%H:%M:%S} Nairobi time.")
+
+
+@st.fragment(run_every="10m")
+def render_live_reporting():
+    st.button("Refresh analytics now", key="refresh_analytics")
+    refreshed_at, live_role, live_view = _live_view()
     # The weekly comparison ignores the in-page filters but keeps the department scope.
     weekly_scope = filter_requests(live_role, department=department_filter, subteam=subteam_filter)
     st.caption(f"Analytics refresh every 10 minutes. Last updated {refreshed_at.tz_convert('Africa/Nairobi'):%H:%M:%S} Nairobi time.")
@@ -545,701 +668,722 @@ def render_live_reporting():
 
     render_weekly_report(weekly_scope, refreshed_at)
 
-render_live_reporting()
 
-# ---- Historical IT workbook import ----
-if USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN:
-    with st.expander("Upload closed IT requests (.xlsx)"):
+# ---- Tabbed layout ----
+tab_overview, tab_tickets, tab_new, tab_reports, tab_admin = st.tabs(
+    ["Overview", "Tickets", "New request", "Reports", "Admin"]
+)
+
+with tab_overview:
+    render_overview()
+
+with tab_reports:
+    render_live_reporting()
+
+with tab_tickets:
+    editor_df = view.copy()
+    tickets_total = len(editor_df)
+    tickets_closed = int(editor_df["Status"].eq("closed").sum())
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Tickets", tickets_total)
+    metric_cols[1].metric("Open", tickets_total - tickets_closed)
+    metric_cols[2].metric("Resolved", tickets_closed)
+
+    if editor_df.empty:
+        st.info("No support requests match the current filters.")
+    else:
+        display = pd.DataFrame({
+            "Ticket": editor_df.apply(
+                lambda row: normalize_text(row["Support Request Number"]) or str(row["Ticket ID"])[:8], axis=1),
+            "Requester type": editor_df["Requester Type"].astype(str).str.strip(),
+            "Department": editor_df["Assigned Department"].astype(str).str.strip(),
+            "Issue": editor_df["Summary"].astype(str).str.strip(),
+            "Requester": editor_df["Requester Name"].astype(str).str.strip(),
+            "Status": editor_df["Status"].astype(str).str.capitalize(),
+            "Reported": pd.to_datetime(editor_df["Reported_dt"], errors="coerce", utc=True).dt.tz_convert("Africa/Nairobi").dt.strftime("%d %b %Y"),
+        })
+        st.dataframe(display, width="stretch", hide_index=True)
+
+        st.divider()
+        st.subheader("Manage support requests")
+        st.caption("Select one request to update its ownership, progress or callback status.")
+        selected_ticket_id = st.selectbox(
+            "Support request",
+            options=editor_df["Ticket ID"].tolist(),
+            format_func=lambda tid: " · ".join(
+                part for part in [
+                    normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Support Request Number"].iloc[0]) or "Request",
+                    normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Requester Name"].iloc[0]),
+                    normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].iloc[0]),
+                ] if part
+            ),
+        )
+        selected = editor_df.loc[editor_df["Ticket ID"] == selected_ticket_id].iloc[0]
+        render_request_deadlines(ws, selected_ticket_id)
+
         st.caption(
-            "Upload an IT Requests workbook, check the preview, and import directly into IT. "
-            "An external key can only be imported once. Dates without a timezone are Nairobi time."
+            f"{normalize_text(selected['Requester Type']) or 'Requester'}"
+            f"  •  {normalize_text(selected['Channel']) or 'Channel not recorded'}"
+            f"  •  Job ID: {normalize_text(selected['Job Request ID']) or 'Not applicable'}"
+            f"  •  Reg No: {normalize_text(selected['Reg No']) or 'Not recorded'}"
         )
-        if result := st.session_state.pop("it_workbook_result", None):
-            st.success(f"Created {result[0]} closed IT requests. Skipped {result[1]} existing keys.")
-        workbook = st.file_uploader("IT requests workbook", type=["xlsx"], key="it_workbook_import")
-        if workbook is not None:
-            try:
-                tickets = read_it_workbook(workbook.getvalue())
-            except ValueError as error:
-                st.error(str(error))
-            else:
-                st.dataframe([
-                    {
-                        "External Key": ticket["external_key"], "Summary": ticket["summary"],
-                        "Assignee": ticket["assignee"], "Reported At": ticket["reported_at"],
-                        "Resolved At": ticket["resolved_at"], "Closed At": ticket["closed_at"],
-                        "Resolution Summary": ticket["resolution_summary"],
-                    }
-                    for ticket in tickets
-                ], width="stretch", hide_index=True)
-                if st.button(f"Import {len(tickets)} closed IT requests", type="primary"):
-                    try:
-                        count = import_it_tickets(ws.session_factory, tickets, actor=current_user.username)
-                    except SQLAlchemyError:
-                        st.error("The database could not import this workbook. No partial batch was saved.")
-                    else:
-                        st.session_state.it_workbook_result = (count, len(tickets) - count)
-                        st.rerun()
-
-# ---- Jira import ----
-with st.expander("Import and normalize Jira data"):
-    st.caption("Upload a Jira CSV to preview its normalized production schema. Existing stable Ticket IDs are skipped.")
-    jira_upload = st.file_uploader("Jira CSV export", type=["csv"], key="jira_import")
-    if jira_upload is not None:
-        normalized_jira = normalize_jira_csv(jira_upload.getvalue())
-        jira_stats = import_summary(normalized_jira)
-        j1, j2, j3, j4 = st.columns(4)
-        j1.metric("Rows", jira_stats["rows"])
-        j2.metric("Jira keys", jira_stats["with_external_key"])
-        j3.metric("Assigned", jira_stats["with_assignee"])
-        j4.metric("Invalid dates", jira_stats["invalid_created"])
-        st.dataframe(normalized_jira.head(25), width="stretch", hide_index=True)
-        st.download_button(
-            "Download normalized preview",
-            normalized_jira.to_csv(index=False).encode("utf-8"),
-            "jira-normalized.csv",
-            "text/csv",
-        )
-        if st.button("Import new Jira tickets", type="primary"):
-            existing = read_df(ws, REQUIRED_HEADERS)
-            existing_ids = set(existing["Ticket ID"].astype(str))
-            new_rows = normalized_jira[~normalized_jira["Ticket ID"].isin(existing_ids)]
-            if new_rows.empty:
-                st.info("No new tickets were found.")
-            else:
-                ws.append_rows(new_rows[REQUIRED_HEADERS].fillna("").values.tolist())
-                now_stamp = datetime.now().isoformat(timespec="seconds")
-                actor = st.session_state.get("user", "dashboard-user")
-                activity_rows = [
-                    [str(uuid.uuid4()), row["Ticket ID"], "jira_imported", "External Key", "", row["External Key"], "", now_stamp, actor]
-                    for _, row in new_rows.iterrows()
-                ]
-                activity_ws.append_rows(activity_rows)
-                st.success(f"Imported {len(new_rows)} new Jira ticket(s).")
-                st.rerun()
-
-st.divider()
-
-# ---- WhatsApp intake ----
-if USE_DATABASE:
-    # Reuse the connection pool without caching a store instance across app updates.
-    draft_store = DraftStore(ws.session_factory)
-    with st.expander("Import from WhatsApp"):
         st.caption(
-            "Upload an exported WhatsApp chat (.txt or .zip), choose a date range, and scan it. "
-            "Genuine issues (complaints, app misbehaviour, improvement suggestions) become draft "
-            "requests you review below. Routine chatter (approvals, dispatch, logbooks) is ignored. "
-            + ("AI extraction is on." if OPENAI_API_KEY else "No OpenAI key set, so a keyword fallback is used (lower quality).")
+            f"Owned by **{normalize_text(selected['Assigned Department']) or 'Unassigned department'}**"
+            + (f" · {normalize_text(selected['Assigned Sub-team'])}" if normalize_text(selected["Assigned Sub-team"]) else "")
+            + f"  •  Reported by {normalize_text(selected['Reporting Department']) or 'Unknown'}"
         )
-        wa_upload = st.file_uploader("WhatsApp chat export", type=["txt", "zip"], key="whatsapp_import")
-        if wa_upload is not None:
-            messages = parse_whatsapp_cached(wa_upload.getvalue(), wa_upload.name)
-            convo = [m for m in messages if not m["system"] and m["sender"]]
-            stamps = [s for s in (parse_timestamp(m["timestamp"]) for m in convo if m["timestamp"]) if pd.notna(s)]
-            if not stamps:
-                st.warning("No dated messages were found. Export the chat without media and try again.")
-            else:
-                min_date, max_date = min(stamps).date(), max(stamps).date()
-                st.caption(f"Chat spans {min_date:%d %b %Y} to {max_date:%d %b %Y} ({len(convo)} messages).")
-                default_start = max(min_date, max_date - timedelta(days=7))
-                range_left, range_right = st.columns(2)
-                start_date = range_left.date_input("From", value=default_start, min_value=min_date, max_value=max_date, key="wa_from")
-                end_date = range_right.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key="wa_to")
-                if start_date > end_date:
-                    st.error("The 'From' date must be on or before the 'To' date.")
-                else:
-                    windowed = [
-                        m for m in convo
-                        if (ts := parse_timestamp(m["timestamp"])) is not None and pd.notna(ts)
-                        and start_date <= ts.date() <= end_date
-                    ]
-                    st.caption(f"{len(windowed)} messages in the selected range.")
-                    if len(windowed) > 3000:
-                        st.warning("That is a large range. Narrow the dates to keep the scan fast and within API limits.")
-                    if st.button("Scan range for issues", key="scan_whatsapp", disabled=not windowed):
-                        with st.spinner("Reading messages and drafting issues…"):
-                            issues = extract_issues(
-                                windowed, categories=INTAKE_CATEGORIES,
-                                api_key=OPENAI_API_KEY or None, model=OPENAI_MODEL,
-                            )
-                            known = draft_store.fingerprints()
-                            added = 0
-                            for issue in issues:
-                                if issue["source_fingerprint"] in known:
-                                    continue
-                                draft_store.add({
-                                    **issue, "source": "whatsapp",
-                                    "source_reference": f"{wa_upload.name} [{start_date}..{end_date}]",
-                                })
-                                known.add(issue["source_fingerprint"])
-                                added += 1
-                        skipped = len(issues) - added
-                        if added:
-                            st.success(f"Created {added} draft(s)" + (f", skipped {skipped} already seen." if skipped else "."))
-                            st.rerun()
-                        else:
-                            st.info("No new issues found in that range." + (f" ({skipped} already seen.)" if skipped else ""))
+        can_manage_selected = can_manage(
+            department=current_user.department, admin=is_admin_user, ticket_department=selected["Assigned Department"]
+        )
+        if not can_manage_selected:
+            st.info("This request is owned by another department. You have view-only access and can add a note below.")
 
-    # ---- Pending intake (drafts awaiting approval) ----
-    pending_drafts = draft_store.list("pending")
-    visible_drafts = [
-        draft for draft in pending_drafts
-        if view_all_user
-        or not normalize_department(draft["suggested_department"])
-        or normalize_department(draft["suggested_department"]) == current_user.department
-    ]
-    st.subheader(f"Pending intake ({len(visible_drafts)})")
-    if draft_message := st.session_state.pop("draft_action_message", None):
-        st.info(draft_message)
-    st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
-    if not visible_drafts:
-        st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
-    may_delete_drafts = can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN
-    if may_delete_drafts and visible_drafts:
-        with st.expander("Bulk delete drafts"):
-            labels = {
-                draft["draft_id"]: f"{draft['summary'] or 'Draft request'} ({draft['draft_id'][:8]})"
-                for draft in visible_drafts
-            }
-            select_all = st.checkbox(f"Select all {len(labels)} pending drafts", key="delete_all_drafts")
-            selected_drafts = list(labels) if select_all else st.multiselect(
-                "Drafts to delete", options=list(labels), format_func=labels.__getitem__,
-                key="bulk_draft_selection",
+        # The reassignment department sits outside the form so choosing a department
+        # with sub-teams immediately reveals the required sub-team picker.
+        current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+        new_department = st.selectbox(
+            "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
+            key=f"reassign_dept_{selected_ticket_id}", disabled=not can_manage_selected,
+            help="Reassign this request to another department. Choosing a department with sub-teams requires selecting one below.",
+        )
+
+        with st.form("save_edits_form"):
+            corrected_reported_at = st.datetime_input(
+                "Reported at (Nairobi time)", value=nairobi_input_value(reported_time(selected)), key=f"edit_reported_at_{selected_ticket_id}",
+                help="Correct the actual reporting time. This recalculates SLA deadlines and leaves the dashboard entry timestamp unchanged.",
             )
-            if st.button(
-                f"Delete {len(selected_drafts)} selected drafts", icon=":material/delete:",
-                key="bulk_delete_drafts", disabled=not selected_drafts,
-            ):
-                removed = draft_store.delete_pending_many(selected_drafts)
-                st.session_state.draft_action_message = (
-                    f"Deleted {removed} pending draft(s). "
-                    f"{len(selected_drafts) - removed} no longer pending."
-                    if removed != len(selected_drafts)
-                    else f"Deleted {removed} pending draft(s)."
+            update_left, update_right = st.columns(2)
+            with update_left:
+                status_value = normalize_text(selected["Status"]).lower()
+                new_status = st.selectbox(
+                    "Status",
+                    options=STATUSES,
+                    index=STATUSES.index(status_value) if status_value in STATUSES else 0,
+                    help="Resolved requests can move directly to Closed. Add a resolution summary before saving.",
                 )
-                st.rerun()
-    priority_choices = ["Low", "Medium", "High", "Highest"]
-    for draft in visible_drafts:
-        did = draft["draft_id"]
-        header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
-        draft_details = st
-        if may_delete_drafts:
-            draft_details, draft_action = st.columns([11, 1], vertical_alignment="top")
-            if draft_action.button("🗑", help="Delete draft", key=f"delete_draft_{did}"):
-                removed = draft_store.delete_pending(did)
-                st.session_state.draft_action_message = (
-                    "Draft deleted." if removed else "This draft is no longer pending."
+                priority_value = normalize_text(selected["Priority"])
+                priority_options = ["Low", "Medium", "High", "Urgent"]
+                new_priority = st.selectbox(
+                    "Priority",
+                    options=priority_options,
+                    index=priority_options.index(priority_value) if priority_value in priority_options else 1,
                 )
-                st.rerun()
-        with draft_details.expander(header):
-            summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
-            description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                category = st.selectbox("Category", INTAKE_CATEGORIES, index=option_index(INTAKE_CATEGORIES, draft["category"], len(INTAKE_CATEGORIES) - 1), key=f"dcat_{did}")
-            with col_b:
-                priority = st.selectbox("Priority", priority_choices, index=option_index(priority_choices, draft["priority"], 1), key=f"dpri_{did}")
-            with col_c:
-                dept_options = ["— Select department —"] + DEPARTMENTS
-                suggested_dept = normalize_department(draft["suggested_department"])
-                dept_index = dept_options.index(suggested_dept) if suggested_dept in dept_options else 0
-                department_choice = st.selectbox("Assign to department *", dept_options, index=dept_index, key=f"ddept_{did}")
-                department = "" if department_choice.startswith("—") else department_choice
-            draft_subteams = subteams_for(department)
-            if draft_subteams:
-                current_sub = clean_subteam(department, draft["suggested_subteam"])
-                sub_options = ["— Select sub-team —"] + draft_subteams
-                sub_choice = st.selectbox(
-                    f"{department} sub-team *", sub_options,
-                    index=sub_options.index(current_sub) if current_sub in sub_options else 0, key=f"dsub_{did}",
+                new_assignee = st.text_input("Assigned support agent", value=normalize_text(selected["Assignee"]))
+            with update_right:
+                callback_value = normalize_text(selected["Callback Required"])
+                new_callback_required = st.checkbox("Callback required", value=callback_value == "Yes")
+                new_callback_deadline = st.text_input(
+                    "Callback deadline",
+                    value=normalize_text(selected["Callback Deadline"]),
+                    placeholder="YYYY-MM-DD HH:MM",
+                    disabled=not new_callback_required,
                 )
-                draft_subteam = "" if sub_choice.startswith("—") else sub_choice
-            else:
-                draft_subteam = ""
-            if draft["requester_name"] or draft["contact"]:
-                st.caption(f"Requester: {draft['requester_name'] or 'Unknown'}  ·  {draft['contact'] or 'no contact'}")
-            if draft["excerpt"]:
-                st.caption("Chat excerpt")
-                st.code(draft["excerpt"])
-            review_note = st.text_input("Note (or reason for rejecting)", key=f"dnote_{did}")
-            may_route = can_manage(department=current_user.department, admin=is_admin_user, ticket_department=department)
-            approve_col, reject_col = st.columns(2)
-            approve = approve_col.button("Approve as support request", type="primary", key=f"dok_{did}", disabled=not may_route)
-            reject = reject_col.button("Reject", key=f"dno_{did}", disabled=not may_route)
-            if not may_route:
-                st.caption("Only the owning department or an admin can approve or reject this draft.")
+                callback_done = st.checkbox(
+                    "Callback completed",
+                    value=bool(normalize_text(selected["Callback Completed At"])),
+                )
 
-            if approve:
-                if not department:
-                    st.error("Choose a department before approving.")
+            route_subteams = subteams_for(new_department)
+            if route_subteams:
+                current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
+                route_options = ["— Select sub-team —"] + route_subteams
+                route_choice = st.selectbox(
+                    f"{new_department} sub-team *", route_options,
+                    index=route_options.index(current_subteam) if current_subteam in route_options else 0,
+                    help="Required for this department. Pick the exact team that owns this request.",
+                )
+                new_subteam = "" if route_choice.startswith("—") else route_choice
+            else:
+                new_subteam = ""
+
+            resolution_summary = st.text_area(
+                "Resolution summary",
+                value=normalize_text(selected["Resolution Summary"]),
+                placeholder="What was done to resolve or progress this request?",
+            )
+            st.caption("Record when you first responded and understood the problem. Use Nairobi time; leave unknown times blank.")
+            response_column, diagnosis_column = st.columns(2)
+            with response_column:
+                first_response_at = st.datetime_input(
+                    "First response sent at", value=nairobi_input_value(selected["First Response At"]),
+                )
+                mark_responded = st.form_submit_button(
+                    "Mark responded",
+                    disabled=bool(normalize_text(selected["First Response At"])) or selected["Status"] == "closed" or not can_manage_selected,
+                    help="Record the first response as now and save the current form edits. Use only after responding to the requester.",
+                )
+            with diagnosis_column:
+                diagnosed_at = st.datetime_input(
+                    "Problem diagnosed at", value=nairobi_input_value(selected["Diagnosed At"]),
+                )
+                mark_diagnosed = st.form_submit_button(
+                    "Mark diagnosed",
+                    disabled=bool(normalize_text(selected["Diagnosed At"])) or selected["Status"] == "closed" or not can_manage_selected,
+                    help="Record diagnosis as now and save the current form edits. A To do request moves to Diagnosed.",
+                )
+            st.caption("Milestone buttons record the time now and save your form edits. Use the date fields to correct earlier times.")
+            update_note = st.text_area("Update note", placeholder="Add context for this change")
+            save_edits = st.form_submit_button("Save request update", type="primary", disabled=not can_manage_selected)
+
+        if save_edits or mark_responded or mark_diagnosed:
+            if not can_manage_selected:
+                st.error("You do not have permission to edit this request.")
+                st.stop()
+            if subteams_for(new_department) and not clean_subteam(new_department, new_subteam):
+                st.error(f"Select a {new_department} sub-team before saving.")
+                st.stop()
+            base = read_df(ws, REQUIRED_HEADERS)
+            base = pd.DataFrame(base)
+            for col in REQUIRED_HEADERS:
+                if col not in base.columns:
+                    base[col] = ""
+
+            if base["Ticket ID"].astype(str).duplicated().any():
+                st.error("Duplicate Ticket IDs were found. Resolve them before editing.")
+                st.stop()
+
+            base_idx = base.set_index("Ticket ID", drop=False)
+            tid = selected_ticket_id
+            if tid not in base_idx.index:
+                st.error("This request no longer exists. Refresh to select another request.")
+                st.stop()
+            current = {col: normalize_text(base_idx.loc[tid, col]) for col in REQUIRED_HEADERS}
+            # Treat a legacy blank department as its normalized default so simply
+            # opening and saving a request does not log a phantom routing change.
+            current["Assigned Department"] = normalize_department(current["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+            proposed = current.copy()
+            if corrected_reported_at != nairobi_input_value(reported_time(selected)):
+                if corrected_reported_at is None:
+                    st.error("Set the date and time the request was reported.")
                     st.stop()
-                if not summary.strip():
-                    st.error("Add a summary before approving.")
+                proposed["Reported At"] = nairobi_timestamp(corrected_reported_at)
+            for field, entered in [("First Response At", first_response_at), ("Diagnosed At", diagnosed_at)]:
+                # Preserve the stored timestamp unless the user actually changes it.
+                if entered != nairobi_input_value(selected[field]):
+                    proposed[field] = nairobi_timestamp(entered)
+            proposed.update({
+                "Status": new_status,
+                "Priority": new_priority,
+                "Assignee": new_assignee.strip(),
+                "Callback Required": "Yes" if new_callback_required else "No",
+                "Callback Deadline": new_callback_deadline.strip() if new_callback_required else "",
+                "Callback Completed At": (
+                    current["Callback Completed At"] or datetime.now().astimezone().isoformat(timespec="seconds")
+                ) if callback_done else "",
+                "Resolution Summary": resolution_summary.strip(),
+                "Assigned Department": new_department,
+                "Assigned Sub-team": clean_subteam(new_department, new_subteam),
+            })
+            current["Status"] = current["Status"].lower()
+            now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            reporting_changed = proposed["Reported At"] != current["Reported At"]
+            reported_stamp = pd.to_datetime(reported_time(proposed), errors="coerce", utc=True)
+            if reporting_changed and (pd.isna(reported_stamp) or reported_stamp > pd.Timestamp.now(tz="UTC") or reported_stamp > pd.to_datetime(current["Created"], utc=True)):
+                st.error("Reporting time must not be later than the dashboard entry time or now.")
+                st.stop()
+
+            if mark_responded or mark_diagnosed:
+                if current["Status"] == "closed":
+                    st.error("This request is already closed. Use the date fields to correct its recorded times.")
                     st.stop()
-                if draft_subteams and not draft_subteam:
-                    st.error(f"Select a {department} sub-team before approving.")
+                field = "First Response At" if mark_responded else "Diagnosed At"
+                proposed[field] = current[field] or now_stamp
+                if mark_diagnosed and current["Status"] == "to do" and proposed["Status"] == "to do":
+                    proposed["Status"] = "diagnosed"
+
+            for field in ["First Response At", "Diagnosed At", "Resolved At", "Closed At"]:
+                if (proposed[field] != current[field] or reporting_changed) and proposed[field]:
+                    timestamp = pd.to_datetime(proposed[field], utc=True)
+                    received = reported_stamp
+                    closed = pd.to_datetime(current["Closed At"], errors="coerce", utc=True)
+                    if pd.isna(received) or timestamp < received or timestamp > pd.Timestamp.now(tz="UTC"):
+                        st.error(f"{field} must be between when the request was reported and now.")
+                        st.stop()
+                    if current["Status"] == "closed" and pd.notna(closed) and timestamp > closed:
+                        st.error(f"{field} cannot be after request closure.")
+                        st.stop()
+
+            if new_callback_required and new_callback_deadline and not valid_datetime(new_callback_deadline):
+                st.error("Callback deadline must use a valid date and time.")
+                st.stop()
+            if current["Status"] != proposed["Status"]:
+                if proposed["Status"] == "closed" and not proposed["Resolution Summary"]:
+                    st.error("Add a resolution summary before closing this request.")
                     st.stop()
+                if not can_transition(current["Status"], proposed["Status"]):
+                    st.error(
+                        f"This request cannot move directly from {current['Status']} "
+                        f"to {proposed['Status']}. Follow the defined workflow."
+                    )
+                    st.stop()
+                if proposed["Status"] in ["diagnosed", "in progress", "qa testing", "deployed"] and not proposed["Diagnosed At"]:
+                    proposed["Diagnosed At"] = now_stamp
+                if proposed["Status"] in ["deployed", "closed"] and not proposed["Resolved At"]:
+                    proposed["Resolved At"] = now_stamp
+                if proposed["Status"] == "closed":
+                    proposed["Closed At"] = now_stamp
+                if current["Status"] == "closed" and proposed["Status"] != "closed":
+                    proposed["Closed At"] = ""
+
+            changed_fields = [
+                field for field in REQUIRED_HEADERS
+                if field not in ["Ticket ID", "Updated At"] and current[field] != proposed[field]
+            ]
+            if not changed_fields:
+                st.info("No changes to save.")
+                st.stop()
+
+            proposed["Updated At"] = now_stamp
+            update_ticket(ws, tid, proposed)
+            for field in changed_fields:
+                append_activity(
+                    activity_ws,
+                    ticket_id=tid,
+                    action="status_changed" if field == "Status" else "field_edited",
+                    field=field,
+                    old_value=current[field],
+                    new_value=proposed[field],
+                    note=update_note.strip(),
+                )
+
+            st.success("Support request updated.")
+            st.rerun()
+
+        if not can_manage_selected:
+            with st.form("viewer_note_form", clear_on_submit=True):
+                viewer_note = st.text_area("Add a note", placeholder="Add context or a question for the owning department")
+                note_submitted = st.form_submit_button("Add note")
+            if note_submitted and viewer_note.strip():
+                append_activity(activity_ws, selected_ticket_id, "note_added", "Note", "", "", viewer_note.strip())
+                st.success("Note added.")
+                st.rerun()
+
+        if can_delete(admin=is_admin_user):
+            st.divider()
+            colA, colB = st.columns([1, 1])
+            with colA:
+                delete_ids = st.multiselect(
+                    "Delete tickets (select by Summary)",
+                    options=editor_df["Ticket ID"].tolist(),
+                    format_func=lambda tid: editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].values[0],
+                )
+            with colB:
+                delete_note = st.text_input("Delete note (optional)", placeholder="Why is this ticket being deleted?")
+
+            if st.button("Delete selected"):
+                if not delete_ids:
+                    st.warning("Select at least one ticket to delete.")
+                    st.stop()
+                base = read_df(ws, REQUIRED_HEADERS)
+                base = pd.DataFrame(base)
+                doomed = base[base["Ticket ID"].isin(delete_ids)].copy()
+                for _, row in doomed.iterrows():
+                    append_activity(
+                        activity_ws,
+                        ticket_id=row["Ticket ID"],
+                        action="ticket_deleted",
+                        field="Status",
+                        old_value=row.get("Status", ""),
+                        new_value="",
+                        note=delete_note.strip(),
+                    )
+                delete_tickets(ws, delete_ids)
+                st.success(f"Deleted {len(delete_ids)} ticket(s).")
+                st.rerun()
+
+        st.divider()
+        st.subheader("History for this request")
+        activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
+        request_label = normalize_text(selected["Support Request Number"]) or normalize_text(selected["Summary"])
+        st.caption(f"{request_label} · Updates to the request selected above, newest first.")
+        history = request_history(activity_df, selected_ticket_id)
+        for entry in history:
+            stamp = pd.to_datetime(entry["timestamp"], errors="coerce", utc=True)
+            if pd.notna(stamp):
+                stamp = stamp.tz_convert("Africa/Nairobi")
+            when = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date unavailable"
+            with st.container(border=True):
+                st.markdown(f"**{entry['title']}**")
+                st.caption(when)
+                for detail in entry["details"]:
+                    st.text(detail)
+        if not history:
+            st.caption("No updates recorded for this request yet.")
+
+with tab_new:
+    st.subheader("New support request")
+    st.caption("Capture a Solver, Solvit Office Team, or External Clients request in under a minute.")
+    requester_type = st.segmented_control(
+        "Who needs support?", ["Solver", "Solvit Office Team", "External Clients"], default="Solver", key="intake_requester_type"
+    )
+    channel = st.segmented_control(
+        "How did they reach out?", ["Call", "WhatsApp", "SMS", "Email", "Other"], default="Call", key="intake_channel"
+    )
+    default_department = current_user.department if current_user.department in DEPARTMENTS else DEPARTMENTS[0]
+    assign_department = st.segmented_control(
+        "Assign to department", DEPARTMENTS, default=default_department, key="intake_assign_department"
+    ) or default_department
+
+    with st.form("quick_support_intake", clear_on_submit=True):
+        reported_at = st.datetime_input(
+            "Reported at (Nairobi time) *", value=None, key="intake_reported_at",
+            help="Choose when the call, message, or email was actually received. The dashboard entry time is saved separately.",
+        )
+        st.caption("The SLA clock starts at the reporting time selected above, including for requests entered later.")
+        identity_left, identity_right = st.columns(2)
+        with identity_left:
+            if requester_type == "Solver":
+                job_request_id = st.text_input("Job Request ID *", placeholder="The job Request-ID shared by the Solver")
+                reg_no = st.text_input("Reg No", placeholder="Vehicle registration number, e.g. KDA 123A")
+            elif requester_type == "External Clients":
+                job_request_id = st.text_input("Job Request ID", placeholder="Optional related job Request-ID")
+                reg_no = st.text_input("Reg No", placeholder="Vehicle registration number, if applicable")
+            else:
+                job_request_id = ""
+                reg_no = ""
+                office_department = st.text_input("Office department", placeholder="e.g. Operations, Finance")
+        with identity_right:
+            phone = st.text_input("Phone / WhatsApp number", placeholder="e.g. 2547XXXXXXXX")
+            received_by = st.text_input("Received by *", placeholder="Solvit team member")
+            assigned_to = st.text_input("Assign support agent", placeholder="Leave blank if not assigned")
+
+        if subteams_for(assign_department):
+            intake_subteam_options = ["— Select sub-team —"] + subteams_for(assign_department)
+            intake_subteam_choice = st.selectbox(f"{assign_department} sub-team *", intake_subteam_options, key="intake_subteam")
+            assign_subteam = "" if intake_subteam_choice.startswith("—") else intake_subteam_choice
+        else:
+            assign_subteam = ""
+        st.caption(
+            f"Routing to **{assign_department}**"
+            + (f" · {assign_subteam}" if assign_subteam else "")
+            + f".  Reporting department: **{current_user.department}** (recorded automatically)."
+        )
+
+        issue_left, issue_right = st.columns([1.45, 1])
+        with issue_left:
+            summary = st.text_input("Issue summary *", placeholder="Short, clear description of the support need")
+            description = st.text_area("Request details", placeholder="What happened, what was expected, and any troubleshooting already done")
+        with issue_right:
+            category = st.selectbox("Category", ["Access & login", "App issue", "Job or request issue", "Payments", "Account or profile", "Technical guidance", "Other"])
+            priority = st.selectbox("Priority", ["Medium", "High", "Highest", "Low"])
+
+        call_outcome = ""
+        callback_required = False
+        callback_deadline = ""
+        if channel == "Call":
+            call_left, call_middle, call_right = st.columns(3)
+            with call_left:
+                call_outcome = st.selectbox("Call outcome", ["Answered", "Missed", "Follow-up needed"])
+            with call_middle:
+                callback_required = st.checkbox("Callback required")
+            with call_right:
+                callback_deadline_input = st.datetime_input("Callback deadline", value=None)
+                callback_deadline = callback_deadline_input.isoformat(timespec="seconds") if callback_deadline_input else ""
+
+        submitted = st.form_submit_button("Create support request", type="primary", width="stretch")
+        if submitted:
+            errors = []
+            if reported_at is None:
+                errors.append("Set the date and time the request was reported.")
+            elif pd.Timestamp(nairobi_timestamp(reported_at)) > pd.Timestamp.now(tz="UTC"):
+                errors.append("Reporting time cannot be in the future.")
+            if requester_type == "Solver" and not job_request_id.strip(): errors.append("Job Request ID is required for Solver requests.")
+            if not received_by.strip(): errors.append("Received by is required.")
+            if not summary.strip(): errors.append("Issue summary is required.")
+            if callback_required and not callback_deadline: errors.append("Set a callback deadline when a callback is required.")
+            if subteams_for(assign_department) and not assign_subteam:
+                errors.append(f"Select a {assign_department} sub-team.")
+            if errors:
+                for error in errors: st.error(error)
+            else:
                 ticket_id = str(uuid.uuid4())
                 now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
                 support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
-                reported_ts = pd.to_datetime(draft["reported_at"], errors="coerce", utc=True) if draft["reported_at"] else pd.NaT
-                reported_value = draft["reported_at"] if (pd.notna(reported_ts) and reported_ts <= pd.Timestamp.now(tz="UTC")) else now_stamp
                 new = {
                     "Ticket ID": ticket_id, "Support Request Number": support_number,
                     "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
                     "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
-                    "Reported At": reported_value, "Requester Type": "External Clients",
-                    "Requester Name": draft["requester_name"] or "", "Channel": "WhatsApp",
-                    "Customer WhatsApp": draft["contact"] or "",
-                    "Assigned Department": department, "Assigned Sub-team": draft_subteam,
-                    "Reporting Department": current_user.department, "Callback Required": "No",
+                    "Reported At": nairobi_timestamp(reported_at),
+                    "Requester Type": requester_type,
+                    "Job Request ID": job_request_id.strip(), "Reg No": reg_no.strip().upper(),
+                    "Office Department": office_department.strip() if requester_type == "Solvit Office Team" else "",
+                    "Channel": channel, "Customer WhatsApp": phone.strip(), "Received By": received_by.strip(),
+                    "Assignee": assigned_to.strip(), "Call Outcome": call_outcome,
+                    "Callback Required": "Yes" if callback_required else "No", "Callback Deadline": callback_deadline,
+                    "Assigned Department": assign_department,
+                    "Assigned Sub-team": assign_subteam,
+                    "Reporting Department": current_user.department,
                 }
-                approved = draft_store.resolve(
-                    did, status="approved", reviewed_by=current_user.username,
-                    review_note=review_note.strip(), approved_ticket_id=ticket_id, ticket=new,
-                )
-                st.session_state.draft_action_message = (
-                    f"Approved as {support_number}." if approved else "This draft is no longer pending."
-                )
-                st.rerun()
-            if reject:
-                rejected = draft_store.resolve(
-                    did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip(),
-                )
-                st.session_state.draft_action_message = (
-                    "Draft rejected." if rejected else "This draft is no longer pending."
-                )
+                append_ticket(ws, new)
+                append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
+                append_activity(activity_ws, ticket_id, "intake_recorded", "Support Request Number", "", support_number, f"{requester_type} via {channel}")
+                routed_to = assign_department + (f" / {assign_subteam}" if assign_subteam else "")
+                append_activity(activity_ws, ticket_id, "routed", "Assigned Department", "", routed_to, f"Reported by {current_user.department}")
+                st.success(f"Created {support_number}.")
                 st.rerun()
 
-st.divider()
-
-# ---- Quick support intake ----
-st.subheader("New support request")
-st.caption("Capture a Solver, Solvit Office Team, or External Clients request in under a minute.")
-requester_type = st.segmented_control(
-    "Who needs support?", ["Solver", "Solvit Office Team", "External Clients"], default="Solver", key="intake_requester_type"
-)
-channel = st.segmented_control(
-    "How did they reach out?", ["Call", "WhatsApp", "SMS", "Email", "Other"], default="Call", key="intake_channel"
-)
-default_department = current_user.department if current_user.department in DEPARTMENTS else DEPARTMENTS[0]
-assign_department = st.segmented_control(
-    "Assign to department", DEPARTMENTS, default=default_department, key="intake_assign_department"
-) or default_department
-
-with st.form("quick_support_intake", clear_on_submit=True):
-    reported_at = st.datetime_input(
-        "Reported at (Nairobi time) *", value=None, key="intake_reported_at",
-        help="Choose when the call, message, or email was actually received. The dashboard entry time is saved separately.",
-    )
-    st.caption("The SLA clock starts at the reporting time selected above, including for requests entered later.")
-    identity_left, identity_right = st.columns(2)
-    with identity_left:
-        if requester_type == "Solver":
-            job_request_id = st.text_input("Job Request ID *", placeholder="The job Request-ID shared by the Solver")
-            reg_no = st.text_input("Reg No", placeholder="Vehicle registration number, e.g. KDA 123A")
-        elif requester_type == "External Clients":
-            job_request_id = st.text_input("Job Request ID", placeholder="Optional related job Request-ID")
-            reg_no = st.text_input("Reg No", placeholder="Vehicle registration number, if applicable")
-        else:
-            job_request_id = ""
-            reg_no = ""
-            office_department = st.text_input("Office department", placeholder="e.g. Operations, Finance")
-    with identity_right:
-        phone = st.text_input("Phone / WhatsApp number", placeholder="e.g. 2547XXXXXXXX")
-        received_by = st.text_input("Received by *", placeholder="Solvit team member")
-        assigned_to = st.text_input("Assigned support agent", placeholder="Leave blank if not assigned")
-
-    if subteams_for(assign_department):
-        intake_subteam_options = ["— Select sub-team —"] + subteams_for(assign_department)
-        intake_subteam_choice = st.selectbox(f"{assign_department} sub-team *", intake_subteam_options, key="intake_subteam")
-        assign_subteam = "" if intake_subteam_choice.startswith("—") else intake_subteam_choice
-    else:
-        assign_subteam = ""
-    st.caption(
-        f"Routing to **{assign_department}**"
-        + (f" · {assign_subteam}" if assign_subteam else "")
-        + f".  Reporting department: **{current_user.department}** (recorded automatically)."
-    )
-
-    issue_left, issue_right = st.columns([1.45, 1])
-    with issue_left:
-        summary = st.text_input("Issue summary *", placeholder="Short, clear description of the support need")
-        description = st.text_area("Request details", placeholder="What happened, what was expected, and any troubleshooting already done")
-    with issue_right:
-        category = st.selectbox("Category", ["Access & login", "App issue", "Job or request issue", "Payments", "Account or profile", "Technical guidance", "Other"])
-        priority = st.selectbox("Priority", ["Medium", "High", "Highest", "Low"])
-
-    call_outcome = ""
-    callback_required = False
-    callback_deadline = ""
-    if channel == "Call":
-        call_left, call_middle, call_right = st.columns(3)
-        with call_left:
-            call_outcome = st.selectbox("Call outcome", ["Answered", "Missed", "Follow-up needed"])
-        with call_middle:
-            callback_required = st.checkbox("Callback required")
-        with call_right:
-            callback_deadline_input = st.datetime_input("Callback deadline", value=None)
-            callback_deadline = callback_deadline_input.isoformat(timespec="seconds") if callback_deadline_input else ""
-
-    submitted = st.form_submit_button("Create support request", type="primary", width="stretch")
-    if submitted:
-        errors = []
-        if reported_at is None:
-            errors.append("Set the date and time the request was reported.")
-        elif pd.Timestamp(nairobi_timestamp(reported_at)) > pd.Timestamp.now(tz="UTC"):
-            errors.append("Reporting time cannot be in the future.")
-        if requester_type == "Solver" and not job_request_id.strip(): errors.append("Job Request ID is required for Solver requests.")
-        if not received_by.strip(): errors.append("Received by is required.")
-        if not summary.strip(): errors.append("Issue summary is required.")
-        if callback_required and not callback_deadline: errors.append("Set a callback deadline when a callback is required.")
-        if subteams_for(assign_department) and not assign_subteam:
-            errors.append(f"Select a {assign_department} sub-team.")
-        if errors:
-            for error in errors: st.error(error)
-        else:
-            ticket_id = str(uuid.uuid4())
-            now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-            support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
-            new = {
-                "Ticket ID": ticket_id, "Support Request Number": support_number,
-                "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
-                "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
-                "Reported At": nairobi_timestamp(reported_at),
-                "Requester Type": requester_type,
-                "Job Request ID": job_request_id.strip(), "Reg No": reg_no.strip().upper(),
-                "Office Department": office_department.strip() if requester_type == "Solvit Office Team" else "",
-                "Channel": channel, "Customer WhatsApp": phone.strip(), "Received By": received_by.strip(),
-                "Assignee": assigned_to.strip(), "Call Outcome": call_outcome,
-                "Callback Required": "Yes" if callback_required else "No", "Callback Deadline": callback_deadline,
-                "Assigned Department": assign_department,
-                "Assigned Sub-team": assign_subteam,
-                "Reporting Department": current_user.department,
-            }
-            append_ticket(ws, new)
-            append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
-            append_activity(activity_ws, ticket_id, "intake_recorded", "Support Request Number", "", support_number, f"{requester_type} via {channel}")
-            routed_to = assign_department + (f" / {assign_subteam}" if assign_subteam else "")
-            append_activity(activity_ws, ticket_id, "routed", "Assigned Department", "", routed_to, f"Reported by {current_user.department}")
-            st.success(f"Created {support_number}.")
-            st.rerun()
-
-st.divider()
-
-# ---- Edit + Delete ----
-st.subheader("Manage support requests")
-st.caption("Select one request to update its ownership, progress or callback status.")
-editor_df = view.copy()
-
-if editor_df.empty:
-    st.info("No support requests match the current filters.")
-else:
-    selected_ticket_id = st.selectbox(
-        "Support request",
-        options=editor_df["Ticket ID"].tolist(),
-        format_func=lambda tid: " · ".join(
-            part for part in [
-                normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Support Request Number"].iloc[0]) or "Request",
-                normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Requester Name"].iloc[0]),
-                normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].iloc[0]),
-            ] if part
-        ),
-    )
-    selected = editor_df.loc[editor_df["Ticket ID"] == selected_ticket_id].iloc[0]
-    render_request_deadlines(ws, selected_ticket_id)
-
-    st.caption(
-        f"{normalize_text(selected['Requester Type']) or 'Requester'}"
-        f"  •  {normalize_text(selected['Channel']) or 'Channel not recorded'}"
-        f"  •  Job ID: {normalize_text(selected['Job Request ID']) or 'Not applicable'}"
-        f"  •  Reg No: {normalize_text(selected['Reg No']) or 'Not recorded'}"
-    )
-    st.caption(
-        f"Owned by **{normalize_text(selected['Assigned Department']) or 'Unassigned department'}**"
-        + (f" · {normalize_text(selected['Assigned Sub-team'])}" if normalize_text(selected["Assigned Sub-team"]) else "")
-        + f"  •  Reported by {normalize_text(selected['Reporting Department']) or 'Unknown'}"
-    )
-    can_manage_selected = can_manage(
-        department=current_user.department, admin=is_admin_user, ticket_department=selected["Assigned Department"]
-    )
-    if not can_manage_selected:
-        st.info("This request is owned by another department. You have view-only access and can add a note below.")
-
-    # The reassignment department sits outside the form so choosing a department
-    # with sub-teams immediately reveals the required sub-team picker.
-    current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
-    new_department = st.selectbox(
-        "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
-        key=f"reassign_dept_{selected_ticket_id}", disabled=not can_manage_selected,
-        help="Reassign this request to another department. Choosing a department with sub-teams requires selecting one below.",
-    )
-
-    with st.form("save_edits_form"):
-        corrected_reported_at = st.datetime_input(
-            "Reported at (Nairobi time)", value=nairobi_input_value(reported_time(selected)), key=f"edit_reported_at_{selected_ticket_id}",
-            help="Correct the actual reporting time. This recalculates SLA deadlines and leaves the dashboard entry timestamp unchanged.",
-        )
-        update_left, update_right = st.columns(2)
-        with update_left:
-            status_value = normalize_text(selected["Status"]).lower()
-            new_status = st.selectbox(
-                "Status",
-                options=STATUSES,
-                index=STATUSES.index(status_value) if status_value in STATUSES else 0,
-                help="Resolved requests can move directly to Closed. Add a resolution summary before saving.",
+    # ---- WhatsApp intake ----
+    if USE_DATABASE:
+        # Reuse the connection pool without caching a store instance across app updates.
+        draft_store = DraftStore(ws.session_factory)
+        with st.expander("Import from WhatsApp"):
+            st.caption(
+                "Upload an exported WhatsApp chat (.txt or .zip), choose a date range, and scan it. "
+                "Genuine issues (complaints, app misbehaviour, improvement suggestions) become draft "
+                "requests you review below. Routine chatter (approvals, dispatch, logbooks) is ignored. "
+                + ("AI extraction is on." if OPENAI_API_KEY else "No OpenAI key set, so a keyword fallback is used (lower quality).")
             )
-            priority_value = normalize_text(selected["Priority"])
-            priority_options = ["Low", "Medium", "High", "Urgent"]
-            new_priority = st.selectbox(
-                "Priority",
-                options=priority_options,
-                index=priority_options.index(priority_value) if priority_value in priority_options else 1,
-            )
-            new_assignee = st.text_input("Assigned support agent", value=normalize_text(selected["Assignee"]))
-        with update_right:
-            callback_value = normalize_text(selected["Callback Required"])
-            new_callback_required = st.checkbox("Callback required", value=callback_value == "Yes")
-            new_callback_deadline = st.text_input(
-                "Callback deadline",
-                value=normalize_text(selected["Callback Deadline"]),
-                placeholder="YYYY-MM-DD HH:MM",
-                disabled=not new_callback_required,
-            )
-            callback_done = st.checkbox(
-                "Callback completed",
-                value=bool(normalize_text(selected["Callback Completed At"])),
-            )
+            wa_upload = st.file_uploader("WhatsApp chat export", type=["txt", "zip"], key="whatsapp_import")
+            if wa_upload is not None:
+                messages = parse_whatsapp_cached(wa_upload.getvalue(), wa_upload.name)
+                convo = [m for m in messages if not m["system"] and m["sender"]]
+                stamps = [s for s in (parse_timestamp(m["timestamp"]) for m in convo if m["timestamp"]) if pd.notna(s)]
+                if not stamps:
+                    st.warning("No dated messages were found. Export the chat without media and try again.")
+                else:
+                    min_date, max_date = min(stamps).date(), max(stamps).date()
+                    st.caption(f"Chat spans {min_date:%d %b %Y} to {max_date:%d %b %Y} ({len(convo)} messages).")
+                    default_start = max(min_date, max_date - timedelta(days=7))
+                    range_left, range_right = st.columns(2)
+                    start_date = range_left.date_input("From", value=default_start, min_value=min_date, max_value=max_date, key="wa_from")
+                    end_date = range_right.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key="wa_to")
+                    if start_date > end_date:
+                        st.error("The 'From' date must be on or before the 'To' date.")
+                    else:
+                        windowed = [
+                            m for m in convo
+                            if (ts := parse_timestamp(m["timestamp"])) is not None and pd.notna(ts)
+                            and start_date <= ts.date() <= end_date
+                        ]
+                        st.caption(f"{len(windowed)} messages in the selected range.")
+                        if len(windowed) > 3000:
+                            st.warning("That is a large range. Narrow the dates to keep the scan fast and within API limits.")
+                        if st.button("Scan range for issues", key="scan_whatsapp", disabled=not windowed):
+                            with st.spinner("Reading messages and drafting issues…"):
+                                issues = extract_issues(
+                                    windowed, categories=INTAKE_CATEGORIES,
+                                    api_key=OPENAI_API_KEY or None, model=OPENAI_MODEL,
+                                )
+                                known = draft_store.fingerprints()
+                                added = 0
+                                for issue in issues:
+                                    if issue["source_fingerprint"] in known:
+                                        continue
+                                    draft_store.add({
+                                        **issue, "source": "whatsapp",
+                                        "source_reference": f"{wa_upload.name} [{start_date}..{end_date}]",
+                                    })
+                                    known.add(issue["source_fingerprint"])
+                                    added += 1
+                            skipped = len(issues) - added
+                            if added:
+                                st.success(f"Created {added} draft(s)" + (f", skipped {skipped} already seen." if skipped else "."))
+                                st.rerun()
+                            else:
+                                st.info("No new issues found in that range." + (f" ({skipped} already seen.)" if skipped else ""))
 
-        route_subteams = subteams_for(new_department)
-        if route_subteams:
-            current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
-            route_options = ["— Select sub-team —"] + route_subteams
-            route_choice = st.selectbox(
-                f"{new_department} sub-team *", route_options,
-                index=route_options.index(current_subteam) if current_subteam in route_options else 0,
-                help="Required for this department. Pick the exact team that owns this request.",
-            )
-            new_subteam = "" if route_choice.startswith("—") else route_choice
-        else:
-            new_subteam = ""
-
-        resolution_summary = st.text_area(
-            "Resolution summary",
-            value=normalize_text(selected["Resolution Summary"]),
-            placeholder="What was done to resolve or progress this request?",
-        )
-        st.caption("Record when you first responded and understood the problem. Use Nairobi time; leave unknown times blank.")
-        response_column, diagnosis_column = st.columns(2)
-        with response_column:
-            first_response_at = st.datetime_input(
-                "First response sent at", value=nairobi_input_value(selected["First Response At"]),
-            )
-            mark_responded = st.form_submit_button(
-                "Mark responded",
-                disabled=bool(normalize_text(selected["First Response At"])) or selected["Status"] == "closed" or not can_manage_selected,
-                help="Record the first response as now and save the current form edits. Use only after responding to the requester.",
-            )
-        with diagnosis_column:
-            diagnosed_at = st.datetime_input(
-                "Problem diagnosed at", value=nairobi_input_value(selected["Diagnosed At"]),
-            )
-            mark_diagnosed = st.form_submit_button(
-                "Mark diagnosed",
-                disabled=bool(normalize_text(selected["Diagnosed At"])) or selected["Status"] == "closed" or not can_manage_selected,
-                help="Record diagnosis as now and save the current form edits. A To do request moves to Diagnosed.",
-            )
-        st.caption("Milestone buttons record the time now and save your form edits. Use the date fields to correct earlier times.")
-        update_note = st.text_area("Update note", placeholder="Add context for this change")
-        save_edits = st.form_submit_button("Save request update", type="primary", disabled=not can_manage_selected)
-
-    if save_edits or mark_responded or mark_diagnosed:
-        if not can_manage_selected:
-            st.error("You do not have permission to edit this request.")
-            st.stop()
-        if subteams_for(new_department) and not clean_subteam(new_department, new_subteam):
-            st.error(f"Select a {new_department} sub-team before saving.")
-            st.stop()
-        base = read_df(ws, REQUIRED_HEADERS)
-        base = pd.DataFrame(base)
-        for col in REQUIRED_HEADERS:
-            if col not in base.columns:
-                base[col] = ""
-
-        if base["Ticket ID"].astype(str).duplicated().any():
-            st.error("Duplicate Ticket IDs were found. Resolve them before editing.")
-            st.stop()
-
-        base_idx = base.set_index("Ticket ID", drop=False)
-        tid = selected_ticket_id
-        if tid not in base_idx.index:
-            st.error("This request no longer exists. Refresh to select another request.")
-            st.stop()
-        current = {col: normalize_text(base_idx.loc[tid, col]) for col in REQUIRED_HEADERS}
-        # Treat a legacy blank department as its normalized default so simply
-        # opening and saving a request does not log a phantom routing change.
-        current["Assigned Department"] = normalize_department(current["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
-        proposed = current.copy()
-        if corrected_reported_at != nairobi_input_value(reported_time(selected)):
-            if corrected_reported_at is None:
-                st.error("Set the date and time the request was reported.")
-                st.stop()
-            proposed["Reported At"] = nairobi_timestamp(corrected_reported_at)
-        for field, entered in [("First Response At", first_response_at), ("Diagnosed At", diagnosed_at)]:
-            # Preserve the stored timestamp unless the user actually changes it.
-            if entered != nairobi_input_value(selected[field]):
-                proposed[field] = nairobi_timestamp(entered)
-        proposed.update({
-            "Status": new_status,
-            "Priority": new_priority,
-            "Assignee": new_assignee.strip(),
-            "Callback Required": "Yes" if new_callback_required else "No",
-            "Callback Deadline": new_callback_deadline.strip() if new_callback_required else "",
-            "Callback Completed At": (
-                current["Callback Completed At"] or datetime.now().astimezone().isoformat(timespec="seconds")
-            ) if callback_done else "",
-            "Resolution Summary": resolution_summary.strip(),
-            "Assigned Department": new_department,
-            "Assigned Sub-team": clean_subteam(new_department, new_subteam),
-        })
-        current["Status"] = current["Status"].lower()
-        now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        reporting_changed = proposed["Reported At"] != current["Reported At"]
-        reported_stamp = pd.to_datetime(reported_time(proposed), errors="coerce", utc=True)
-        if reporting_changed and (pd.isna(reported_stamp) or reported_stamp > pd.Timestamp.now(tz="UTC") or reported_stamp > pd.to_datetime(current["Created"], utc=True)):
-            st.error("Reporting time must not be later than the dashboard entry time or now.")
-            st.stop()
-
-        if mark_responded or mark_diagnosed:
-            if current["Status"] == "closed":
-                st.error("This request is already closed. Use the date fields to correct its recorded times.")
-                st.stop()
-            field = "First Response At" if mark_responded else "Diagnosed At"
-            proposed[field] = current[field] or now_stamp
-            if mark_diagnosed and current["Status"] == "to do" and proposed["Status"] == "to do":
-                proposed["Status"] = "diagnosed"
-
-        for field in ["First Response At", "Diagnosed At", "Resolved At", "Closed At"]:
-            if (proposed[field] != current[field] or reporting_changed) and proposed[field]:
-                timestamp = pd.to_datetime(proposed[field], utc=True)
-                received = reported_stamp
-                closed = pd.to_datetime(current["Closed At"], errors="coerce", utc=True)
-                if pd.isna(received) or timestamp < received or timestamp > pd.Timestamp.now(tz="UTC"):
-                    st.error(f"{field} must be between when the request was reported and now.")
-                    st.stop()
-                if current["Status"] == "closed" and pd.notna(closed) and timestamp > closed:
-                    st.error(f"{field} cannot be after request closure.")
-                    st.stop()
-
-        if new_callback_required and new_callback_deadline and not valid_datetime(new_callback_deadline):
-            st.error("Callback deadline must use a valid date and time.")
-            st.stop()
-        if current["Status"] != proposed["Status"]:
-            if proposed["Status"] == "closed" and not proposed["Resolution Summary"]:
-                st.error("Add a resolution summary before closing this request.")
-                st.stop()
-            if not can_transition(current["Status"], proposed["Status"]):
-                st.error(
-                    f"This request cannot move directly from {current['Status']} "
-                    f"to {proposed['Status']}. Follow the defined workflow."
-                )
-                st.stop()
-            if proposed["Status"] in ["diagnosed", "in progress", "qa testing", "deployed"] and not proposed["Diagnosed At"]:
-                proposed["Diagnosed At"] = now_stamp
-            if proposed["Status"] in ["deployed", "closed"] and not proposed["Resolved At"]:
-                proposed["Resolved At"] = now_stamp
-            if proposed["Status"] == "closed":
-                proposed["Closed At"] = now_stamp
-            if current["Status"] == "closed" and proposed["Status"] != "closed":
-                proposed["Closed At"] = ""
-
-        changed_fields = [
-            field for field in REQUIRED_HEADERS
-            if field not in ["Ticket ID", "Updated At"] and current[field] != proposed[field]
+        # ---- Pending intake (drafts awaiting approval) ----
+        pending_drafts = draft_store.list("pending")
+        visible_drafts = [
+            draft for draft in pending_drafts
+            if view_all_user
+            or not normalize_department(draft["suggested_department"])
+            or normalize_department(draft["suggested_department"]) == current_user.department
         ]
-        if not changed_fields:
-            st.info("No changes to save.")
-            st.stop()
+        st.subheader(f"Pending intake ({len(visible_drafts)})")
+        if draft_message := st.session_state.pop("draft_action_message", None):
+            st.info(draft_message)
+        st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
+        if not visible_drafts:
+            st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
+        may_delete_drafts = can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN
+        if may_delete_drafts and visible_drafts:
+            with st.expander("Bulk delete drafts"):
+                labels = {
+                    draft["draft_id"]: f"{draft['summary'] or 'Draft request'} ({draft['draft_id'][:8]})"
+                    for draft in visible_drafts
+                }
+                select_all = st.checkbox(f"Select all {len(labels)} pending drafts", key="delete_all_drafts")
+                selected_drafts = list(labels) if select_all else st.multiselect(
+                    "Drafts to delete", options=list(labels), format_func=labels.__getitem__,
+                    key="bulk_draft_selection",
+                )
+                if st.button(
+                    f"Delete {len(selected_drafts)} selected drafts", icon=":material/delete:",
+                    key="bulk_delete_drafts", disabled=not selected_drafts,
+                ):
+                    removed = draft_store.delete_pending_many(selected_drafts)
+                    st.session_state.draft_action_message = (
+                        f"Deleted {removed} pending draft(s). "
+                        f"{len(selected_drafts) - removed} no longer pending."
+                        if removed != len(selected_drafts)
+                        else f"Deleted {removed} pending draft(s)."
+                    )
+                    st.rerun()
+        priority_choices = ["Low", "Medium", "High", "Highest"]
+        for draft in visible_drafts:
+            did = draft["draft_id"]
+            header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
+            draft_details = st
+            if may_delete_drafts:
+                draft_details, draft_action = st.columns([11, 1], vertical_alignment="top")
+                if draft_action.button("🗑", help="Delete draft", key=f"delete_draft_{did}"):
+                    removed = draft_store.delete_pending(did)
+                    st.session_state.draft_action_message = (
+                        "Draft deleted." if removed else "This draft is no longer pending."
+                    )
+                    st.rerun()
+            with draft_details.expander(header):
+                summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
+                description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    category = st.selectbox("Category", INTAKE_CATEGORIES, index=option_index(INTAKE_CATEGORIES, draft["category"], len(INTAKE_CATEGORIES) - 1), key=f"dcat_{did}")
+                with col_b:
+                    priority = st.selectbox("Priority", priority_choices, index=option_index(priority_choices, draft["priority"], 1), key=f"dpri_{did}")
+                with col_c:
+                    dept_options = ["— Select department —"] + DEPARTMENTS
+                    suggested_dept = normalize_department(draft["suggested_department"])
+                    dept_index = dept_options.index(suggested_dept) if suggested_dept in dept_options else 0
+                    department_choice = st.selectbox("Assign to department *", dept_options, index=dept_index, key=f"ddept_{did}")
+                    department = "" if department_choice.startswith("—") else department_choice
+                draft_subteams = subteams_for(department)
+                if draft_subteams:
+                    current_sub = clean_subteam(department, draft["suggested_subteam"])
+                    sub_options = ["— Select sub-team —"] + draft_subteams
+                    sub_choice = st.selectbox(
+                        f"{department} sub-team *", sub_options,
+                        index=sub_options.index(current_sub) if current_sub in sub_options else 0, key=f"dsub_{did}",
+                    )
+                    draft_subteam = "" if sub_choice.startswith("—") else sub_choice
+                else:
+                    draft_subteam = ""
+                if draft["requester_name"] or draft["contact"]:
+                    st.caption(f"Requester: {draft['requester_name'] or 'Unknown'}  ·  {draft['contact'] or 'no contact'}")
+                if draft["excerpt"]:
+                    st.caption("Chat excerpt")
+                    st.code(draft["excerpt"])
+                review_note = st.text_input("Note (or reason for rejecting)", key=f"dnote_{did}")
+                may_route = can_manage(department=current_user.department, admin=is_admin_user, ticket_department=department)
+                approve_col, reject_col = st.columns(2)
+                approve = approve_col.button("Approve as support request", type="primary", key=f"dok_{did}", disabled=not may_route)
+                reject = reject_col.button("Reject", key=f"dno_{did}", disabled=not may_route)
+                if not may_route:
+                    st.caption("Only the owning department or an admin can approve or reject this draft.")
 
-        proposed["Updated At"] = now_stamp
-        update_ticket(ws, tid, proposed)
-        for field in changed_fields:
-            append_activity(
-                activity_ws,
-                ticket_id=tid,
-                action="status_changed" if field == "Status" else "field_edited",
-                field=field,
-                old_value=current[field],
-                new_value=proposed[field],
-                note=update_note.strip(),
+                if approve:
+                    if not department:
+                        st.error("Choose a department before approving.")
+                        st.stop()
+                    if not summary.strip():
+                        st.error("Add a summary before approving.")
+                        st.stop()
+                    if draft_subteams and not draft_subteam:
+                        st.error(f"Select a {department} sub-team before approving.")
+                        st.stop()
+                    ticket_id = str(uuid.uuid4())
+                    now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                    support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
+                    reported_ts = pd.to_datetime(draft["reported_at"], errors="coerce", utc=True) if draft["reported_at"] else pd.NaT
+                    reported_value = draft["reported_at"] if (pd.notna(reported_ts) and reported_ts <= pd.Timestamp.now(tz="UTC")) else now_stamp
+                    new = {
+                        "Ticket ID": ticket_id, "Support Request Number": support_number,
+                        "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
+                        "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
+                        "Reported At": reported_value, "Requester Type": "External Clients",
+                        "Requester Name": draft["requester_name"] or "", "Channel": "WhatsApp",
+                        "Customer WhatsApp": draft["contact"] or "",
+                        "Assigned Department": department, "Assigned Sub-team": draft_subteam,
+                        "Reporting Department": current_user.department, "Callback Required": "No",
+                    }
+                    approved = draft_store.resolve(
+                        did, status="approved", reviewed_by=current_user.username,
+                        review_note=review_note.strip(), approved_ticket_id=ticket_id, ticket=new,
+                    )
+                    st.session_state.draft_action_message = (
+                        f"Approved as {support_number}." if approved else "This draft is no longer pending."
+                    )
+                    st.rerun()
+                if reject:
+                    rejected = draft_store.resolve(
+                        did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip(),
+                    )
+                    st.session_state.draft_action_message = (
+                        "Draft rejected." if rejected else "This draft is no longer pending."
+                    )
+                    st.rerun()
+
+with tab_admin:
+    # ---- Historical IT workbook import ----
+    if USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN:
+        with st.expander("Upload closed IT requests (.xlsx)"):
+            st.caption(
+                "Upload an IT Requests workbook, check the preview, and import directly into IT. "
+                "An external key can only be imported once. Dates without a timezone are Nairobi time."
             )
+            if result := st.session_state.pop("it_workbook_result", None):
+                st.success(f"Created {result[0]} closed IT requests. Skipped {result[1]} existing keys.")
+            workbook = st.file_uploader("IT requests workbook", type=["xlsx"], key="it_workbook_import")
+            if workbook is not None:
+                try:
+                    tickets = read_it_workbook(workbook.getvalue())
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.dataframe([
+                        {
+                            "External Key": ticket["external_key"], "Summary": ticket["summary"],
+                            "Assignee": ticket["assignee"], "Reported At": ticket["reported_at"],
+                            "Resolved At": ticket["resolved_at"], "Closed At": ticket["closed_at"],
+                            "Resolution Summary": ticket["resolution_summary"],
+                        }
+                        for ticket in tickets
+                    ], width="stretch", hide_index=True)
+                    if st.button(f"Import {len(tickets)} closed IT requests", type="primary"):
+                        try:
+                            count = import_it_tickets(ws.session_factory, tickets, actor=current_user.username)
+                        except SQLAlchemyError:
+                            st.error("The database could not import this workbook. No partial batch was saved.")
+                        else:
+                            st.session_state.it_workbook_result = (count, len(tickets) - count)
+                            st.rerun()
 
-        st.success("Support request updated.")
-        st.rerun()
-
-    if not can_manage_selected:
-        with st.form("viewer_note_form", clear_on_submit=True):
-            viewer_note = st.text_area("Add a note", placeholder="Add context or a question for the owning department")
-            note_submitted = st.form_submit_button("Add note")
-        if note_submitted and viewer_note.strip():
-            append_activity(activity_ws, selected_ticket_id, "note_added", "Note", "", "", viewer_note.strip())
-            st.success("Note added.")
-            st.rerun()
-
-st.divider()
-
-if can_delete(admin=is_admin_user):
-    colA, colB = st.columns([1, 1])
-    with colA:
-        delete_ids = st.multiselect(
-            "Delete tickets (select by Summary)",
-            options=editor_df["Ticket ID"].tolist(),
-            format_func=lambda tid: editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].values[0],
-        )
-    with colB:
-        delete_note = st.text_input("Delete note (optional)", placeholder="Why is this ticket being deleted?")
-
-    if st.button("Delete selected"):
-        if not delete_ids:
-            st.warning("Select at least one ticket to delete.")
-            st.stop()
-        base = read_df(ws, REQUIRED_HEADERS)
-        base = pd.DataFrame(base)
-        doomed = base[base["Ticket ID"].isin(delete_ids)].copy()
-        for _, row in doomed.iterrows():
-            append_activity(
-                activity_ws,
-                ticket_id=row["Ticket ID"],
-                action="ticket_deleted",
-                field="Status",
-                old_value=row.get("Status", ""),
-                new_value="",
-                note=delete_note.strip(),
+    # ---- Jira import ----
+    with st.expander("Import and normalize Jira data"):
+        st.caption("Upload a Jira CSV to preview its normalized production schema. Existing stable Ticket IDs are skipped.")
+        jira_upload = st.file_uploader("Jira CSV export", type=["csv"], key="jira_import")
+        if jira_upload is not None:
+            normalized_jira = normalize_jira_csv(jira_upload.getvalue())
+            jira_stats = import_summary(normalized_jira)
+            j1, j2, j3, j4 = st.columns(4)
+            j1.metric("Rows", jira_stats["rows"])
+            j2.metric("Jira keys", jira_stats["with_external_key"])
+            j3.metric("Assigned", jira_stats["with_assignee"])
+            j4.metric("Invalid dates", jira_stats["invalid_created"])
+            st.dataframe(normalized_jira.head(25), width="stretch", hide_index=True)
+            st.download_button(
+                "Download normalized preview",
+                normalized_jira.to_csv(index=False).encode("utf-8"),
+                "jira-normalized.csv",
+                "text/csv",
             )
-        delete_tickets(ws, delete_ids)
-        st.success(f"Deleted {len(delete_ids)} ticket(s).")
-        st.rerun()
+            if st.button("Import new Jira tickets", type="primary"):
+                existing = read_df(ws, REQUIRED_HEADERS)
+                existing_ids = set(existing["Ticket ID"].astype(str))
+                new_rows = normalized_jira[~normalized_jira["Ticket ID"].isin(existing_ids)]
+                if new_rows.empty:
+                    st.info("No new tickets were found.")
+                else:
+                    ws.append_rows(new_rows[REQUIRED_HEADERS].fillna("").values.tolist())
+                    now_stamp = datetime.now().isoformat(timespec="seconds")
+                    actor = st.session_state.get("user", "dashboard-user")
+                    activity_rows = [
+                        [str(uuid.uuid4()), row["Ticket ID"], "jira_imported", "External Key", "", row["External Key"], "", now_stamp, actor]
+                        for _, row in new_rows.iterrows()
+                    ]
+                    activity_ws.append_rows(activity_rows)
+                    st.success(f"Imported {len(new_rows)} new Jira ticket(s).")
+                    st.rerun()
 
-    st.divider()
-
-# ---- Activity log ----
-st.subheader("History for this request")
-activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
-if not editor_df.empty:
-    request_label = normalize_text(selected["Support Request Number"]) or normalize_text(selected["Summary"])
-    st.caption(f"{request_label} · Updates to the request selected above, newest first.")
-    history = request_history(activity_df, selected_ticket_id)
-    for entry in history:
-        stamp = pd.to_datetime(entry["timestamp"], errors="coerce", utc=True)
-        if pd.notna(stamp):
-            stamp = stamp.tz_convert("Africa/Nairobi")
-        when = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date unavailable"
-        with st.container(border=True):
-            st.markdown(f"**{entry['title']}**")
-            st.caption(when)
-            for detail in entry["details"]:
-                st.text(detail)
-    if not history:
-        st.caption("No updates recorded for this request yet.")
-else:
-    st.caption("Select a request above to see its history.")
+    if not (USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN):
+        st.caption("Additional admin tools appear here for administrators.")
