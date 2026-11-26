@@ -684,8 +684,8 @@ def render_live_reporting():
 
 
 # ---- Tabbed layout ----
-tab_overview, tab_tickets, tab_new, tab_reports, tab_weekly, tab_admin = st.tabs(
-    ["Overview", "Tickets", "New request", "Reports", "Weekly tasks", "Admin"]
+tab_overview, tab_tickets, tab_reports, tab_weekly, tab_admin = st.tabs(
+    ["Overview", "Tickets", "Reports", "Weekly tasks", "Admin"]
 )
 
 with tab_overview:
@@ -854,7 +854,99 @@ with tab_weekly:
                         weekly_store.set_status(task["task_id"], new_status)
                         st.rerun()
 
+def close_ticket_intake():
+    st.session_state.pop("ticket_intake_open", None)
+    st.session_state["ticket_intake_version"] = st.session_state.get("ticket_intake_version", 0) + 1
+
+
+@st.dialog("Add new ticket", width="medium", on_dismiss=close_ticket_intake)
+def add_ticket_dialog():
+    key = f"ticket_intake_{st.session_state.get('ticket_intake_version', 0)}"
+    requester = st.selectbox("Who needs support?", WORKSPACES[1:], index=None, key=f"{key}_requester")
+    default_department = effective_department if effective_department in DEPARTMENTS else current_user.department
+    assign_department = st.selectbox(
+        "Assign to department", DEPARTMENTS,
+        index=DEPARTMENTS.index(default_department) if default_department in DEPARTMENTS else 0,
+        key=f"{key}_department",
+    )
+    subteams = subteams_for(assign_department)
+    with st.form(key, enter_to_submit=False):
+        subteam = st.selectbox("Assign to sub-team", subteams, index=None) if subteams else ""
+        channel = st.selectbox("Channel", ["Email", "Call", "WhatsApp", "SMS", "Other"], index=None)
+        left, right = st.columns(2)
+        reg_no = left.text_input("Reg No").strip().upper()
+        request_id = right.text_input("Job Request ID").strip()
+        if requester == "Solver":
+            st.caption("Enter the Reg No, Job Request ID, or both.")
+        office_department = st.text_input("Office department (optional)").strip() if requester == "Solvit Office Team" else ""
+        company = st.text_input("Company or contact (optional)").strip() if requester == "External Clients" else ""
+        summary = st.text_input("Issue summary").strip()
+        st.caption("Use the actual date and time in Nairobi, even when entering a ticket later.")
+        left, right = st.columns(2)
+        reported = left.datetime_input("Reported at", value=None)
+        resolved = right.datetime_input("Resolved at (optional)", value=None)
+        submitted = st.form_submit_button("Save", type="primary", width="stretch")
+
+    if not submitted:
+        return
+    now = pd.Timestamp.now(tz="Africa/Nairobi")
+    reported_stamp = nairobi_timestamp(reported)
+    resolved_stamp = nairobi_timestamp(resolved)
+    errors = []
+    if not requester or not channel or not summary or not reported:
+        errors.append("Choose a requester type and channel, and enter an issue summary and reported time.")
+    if requester == "Solver" and not (reg_no or request_id):
+        errors.append("Enter a Reg No or Job Request ID.")
+    if subteams and not subteam:
+        errors.append(f"Select a {assign_department} sub-team.")
+    if any(value and pd.Timestamp(value) > now for value in (reported_stamp, resolved_stamp)):
+        errors.append("Reported and resolved times cannot be in the future.")
+    if reported and resolved and resolved < reported:
+        errors.append("Resolved at must be at or after Reported at.")
+    if errors:
+        for error in errors:
+            st.error(error)
+        return
+
+    ticket_id = str(uuid.uuid4())
+    append_ticket(ws, {
+        "Ticket ID": ticket_id,
+        "Support Request Number": f"SUP-{now:%Y%m%d}-{ticket_id[:6].upper()}",
+        "Summary": summary,
+        "Status": "closed" if resolved else "to do",
+        "Created": now.isoformat(),
+        "Updated At": now.isoformat(),
+        "Reported At": reported_stamp,
+        "Resolved At": resolved_stamp,
+        "Closed At": resolved_stamp,
+        "Requester Type": requester,
+        "Requester Name": company,
+        "Channel": channel,
+        "Job Request ID": request_id,
+        "Reg No": reg_no,
+        "Office Department": office_department,
+        "Assigned Department": assign_department,
+        "Assigned Sub-team": subteam or "",
+        "Reporting Department": current_user.department,
+    })
+    st.session_state["new_ticket_saved"] = ticket_id
+    close_ticket_intake()
+    st.rerun()
+
+
 with tab_tickets:
+    if st.button("Add new", type="primary", icon=":material/add:"):
+        st.session_state["ticket_intake_open"] = True
+    if st.session_state.get("ticket_intake_open"):
+        add_ticket_dialog()
+    saved_ticket = st.session_state.pop("new_ticket_saved", None)
+    if saved_ticket:
+        st.success("Ticket saved.")
+        if not view["Ticket ID"].astype(str).eq(saved_ticket).any():
+            st.info("The ticket is outside this view. Check the department, requester, date and status filters.")
+
+    ticket_ids = df.sort_values(["Created_dt", "Ticket ID"], na_position="first")["Ticket ID"]
+    ticket_labels = {ticket_id: f"T-{number:03d}" for number, ticket_id in enumerate(ticket_ids, start=1)}
     editor_df = view.copy()
     tickets_total = len(editor_df)
     tickets_closed = int(editor_df["Status"].eq("closed").sum())
@@ -867,12 +959,16 @@ with tab_tickets:
         st.info("No support requests match the current filters.")
     else:
         display = pd.DataFrame({
-            "Ticket": editor_df.apply(
-                lambda row: normalize_text(row["Support Request Number"]) or str(row["Ticket ID"])[:8], axis=1),
+            "Ticket": editor_df["Ticket ID"].map(ticket_labels),
             "Requester type": editor_df["Requester Type"].astype(str).str.strip(),
             "Department": editor_df["Assigned Department"].astype(str).str.strip(),
             "Issue": editor_df["Summary"].astype(str).str.strip(),
-            "Requester": editor_df["Requester Name"].astype(str).str.strip(),
+            "Reg No / Request ID": editor_df.apply(
+                lambda row: " / ".join(
+                    value for field in ("Reg No", "Job Request ID")
+                    if (value := normalize_text(row[field]))
+                ), axis=1,
+            ),
             "Status": editor_df["Status"].astype(str).str.capitalize(),
             "Reported": pd.to_datetime(editor_df["Reported_dt"], errors="coerce", utc=True).dt.tz_convert("Africa/Nairobi").dt.strftime("%d %b %Y"),
         })
@@ -886,8 +982,7 @@ with tab_tickets:
             options=editor_df["Ticket ID"].tolist(),
             format_func=lambda tid: " · ".join(
                 part for part in [
-                    normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Support Request Number"].iloc[0]) or "Request",
-                    normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Requester Name"].iloc[0]),
+                    ticket_labels[tid],
                     normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].iloc[0]),
                 ] if part
             ),
@@ -1184,118 +1279,7 @@ with tab_tickets:
         if not history:
             st.caption("No updates recorded for this request yet.")
 
-with tab_new:
-    st.subheader("New support request")
-    st.caption("Capture a Solver, Solvit Office Team, or External Clients request in under a minute.")
-    requester_type = st.segmented_control(
-        "Who needs support?", ["Solver", "Solvit Office Team", "External Clients"], default="Solver", key="intake_requester_type"
-    )
-    channel = st.segmented_control(
-        "How did they reach out?", ["Call", "WhatsApp", "SMS", "Email", "Other"], default="Call", key="intake_channel"
-    )
-    default_department = current_user.department if current_user.department in DEPARTMENTS else DEPARTMENTS[0]
-    assign_department = st.segmented_control(
-        "Assign to department", DEPARTMENTS, default=default_department, key="intake_assign_department"
-    ) or default_department
-
-    with st.form("quick_support_intake", clear_on_submit=True):
-        reported_at = st.datetime_input(
-            "Reported at (Nairobi time) *", value=None, key="intake_reported_at",
-            help="Choose when the call, message, or email was actually received. The dashboard entry time is saved separately.",
-        )
-        st.caption("The SLA clock starts at the reporting time selected above, including for requests entered later.")
-        identity_left, identity_right = st.columns(2)
-        with identity_left:
-            if requester_type == "Solver":
-                job_request_id = st.text_input("Job Request ID *", placeholder="The job Request-ID shared by the Solver")
-                reg_no = st.text_input("Reg No", placeholder="Vehicle registration number, e.g. KDA 123A")
-            elif requester_type == "External Clients":
-                job_request_id = st.text_input("Job Request ID", placeholder="Optional related job Request-ID")
-                reg_no = st.text_input("Reg No", placeholder="Vehicle registration number, if applicable")
-            else:
-                job_request_id = ""
-                reg_no = ""
-                office_department = st.text_input("Office department", placeholder="e.g. Operations, Finance")
-        with identity_right:
-            phone = st.text_input("Phone / WhatsApp number", placeholder="e.g. 2547XXXXXXXX")
-            received_by = st.text_input("Received by *", placeholder="Solvit team member")
-            assigned_to = st.text_input("Assign support agent", placeholder="Leave blank if not assigned")
-
-        if subteams_for(assign_department):
-            intake_subteam_options = ["— Select sub-team —"] + subteams_for(assign_department)
-            intake_subteam_choice = st.selectbox(f"{assign_department} sub-team *", intake_subteam_options, key="intake_subteam")
-            assign_subteam = "" if intake_subteam_choice.startswith("—") else intake_subteam_choice
-        else:
-            assign_subteam = ""
-        st.caption(
-            f"Routing to **{assign_department}**"
-            + (f" · {assign_subteam}" if assign_subteam else "")
-            + f".  Reporting department: **{current_user.department}** (recorded automatically)."
-        )
-
-        issue_left, issue_right = st.columns([1.45, 1])
-        with issue_left:
-            summary = st.text_input("Issue summary *", placeholder="Short, clear description of the support need")
-            description = st.text_area("Request details", placeholder="What happened, what was expected, and any troubleshooting already done")
-        with issue_right:
-            category = st.selectbox("Category", ["Access & login", "App issue", "Job or request issue", "Payments", "Account or profile", "Technical guidance", "Other"])
-            priority = st.selectbox("Priority", ["Medium", "High", "Highest", "Low"])
-
-        call_outcome = ""
-        callback_required = False
-        callback_deadline = ""
-        if channel == "Call":
-            call_left, call_middle, call_right = st.columns(3)
-            with call_left:
-                call_outcome = st.selectbox("Call outcome", ["Answered", "Missed", "Follow-up needed"])
-            with call_middle:
-                callback_required = st.checkbox("Callback required")
-            with call_right:
-                callback_deadline_input = st.datetime_input("Callback deadline", value=None)
-                callback_deadline = callback_deadline_input.isoformat(timespec="seconds") if callback_deadline_input else ""
-
-        submitted = st.form_submit_button("Create support request", type="primary", width="stretch")
-        if submitted:
-            errors = []
-            if reported_at is None:
-                errors.append("Set the date and time the request was reported.")
-            elif pd.Timestamp(nairobi_timestamp(reported_at)) > pd.Timestamp.now(tz="UTC"):
-                errors.append("Reporting time cannot be in the future.")
-            if requester_type == "Solver" and not job_request_id.strip(): errors.append("Job Request ID is required for Solver requests.")
-            if not received_by.strip(): errors.append("Received by is required.")
-            if not summary.strip(): errors.append("Issue summary is required.")
-            if callback_required and not callback_deadline: errors.append("Set a callback deadline when a callback is required.")
-            if subteams_for(assign_department) and not assign_subteam:
-                errors.append(f"Select a {assign_department} sub-team.")
-            if errors:
-                for error in errors: st.error(error)
-            else:
-                ticket_id = str(uuid.uuid4())
-                now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-                support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
-                new = {
-                    "Ticket ID": ticket_id, "Support Request Number": support_number,
-                    "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
-                    "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
-                    "Reported At": nairobi_timestamp(reported_at),
-                    "Requester Type": requester_type,
-                    "Job Request ID": job_request_id.strip(), "Reg No": reg_no.strip().upper(),
-                    "Office Department": office_department.strip() if requester_type == "Solvit Office Team" else "",
-                    "Channel": channel, "Customer WhatsApp": phone.strip(), "Received By": received_by.strip(),
-                    "Assignee": assigned_to.strip(), "Call Outcome": call_outcome,
-                    "Callback Required": "Yes" if callback_required else "No", "Callback Deadline": callback_deadline,
-                    "Assigned Department": assign_department,
-                    "Assigned Sub-team": assign_subteam,
-                    "Reporting Department": current_user.department,
-                }
-                append_ticket(ws, new)
-                append_activity(activity_ws, ticket_id, "support_request_created", "Status", "", "to do", description.strip())
-                append_activity(activity_ws, ticket_id, "intake_recorded", "Support Request Number", "", support_number, f"{requester_type} via {channel}")
-                routed_to = assign_department + (f" / {assign_subteam}" if assign_subteam else "")
-                append_activity(activity_ws, ticket_id, "routed", "Assigned Department", "", routed_to, f"Reported by {current_user.department}")
-                st.success(f"Created {support_number}.")
-                st.rerun()
-
+with tab_tickets:
     # ---- WhatsApp intake ----
     if USE_DATABASE:
         # Reuse the connection pool without caching a store instance across app updates.

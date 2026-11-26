@@ -14,47 +14,39 @@ def test_external_client_intake_accepts_optional_job_details(tmp_path, monkeypat
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'clients.db').as_posix()}")
     monkeypatch.setenv("USE_DATABASE", "true")
     monkeypatch.setenv("DASHBOARD_PASSWORD_HASH", "")
-    monkeypatch.setattr(st, "dataframe", lambda *args, **kwargs: None)
-    monkeypatch.setattr(st, "altair_chart", lambda chart, **kwargs: chart.to_dict())
+    tables = []
+    monkeypatch.setattr(st, "dataframe", lambda data, **kwargs: tables.append(data.copy()))
+    monkeypatch.setattr(st, "altair_chart", lambda *args, **kwargs: None)
     st.cache_resource.clear()
     try:
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=30)
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30).run()
         assert not app.exception
-        app.button_group(key="intake_requester_type").set_value("External Clients").run(timeout=30)
-        assert not app.exception
-        assert app.datetime_input(key="intake_reported_at").value is None
-        labels = [field.label for field in app.text_input]
-        assert "Requester name *" not in labels
-        assert "Office department" not in labels
-        assert "Job Request ID *" not in labels
+        assert "New request" not in [tab.label for tab in app.tabs]
+        next(button for button in app.button if button.label == "Add new").click().run()
+        next(field for field in app.selectbox if field.label == "Who needs support?").set_value("External Clients").run()
+        assert not any(field.label == "Solver ID" for field in app.text_input)
+        next(field for field in app.selectbox if field.label == "Channel").set_value("Email")
         for label, value in {
-            "Received by *": "Peris",
-            "Issue summary *": "Need help with an inspection", "Job Request ID": job_id,
-            "Reg No": reg_no, "Phone / WhatsApp number": "254700000000",
+            "Issue summary": "Need help with an inspection", "Job Request ID": job_id, "Reg No": reg_no,
         }.items():
             next(field for field in app.text_input if field.label == label).set_value(value)
-        app.datetime_input(key="intake_reported_at").set_value(datetime(2026, 9, 9, 21, 0))
-        next(button for button in app.button if button.label == "Create support request").click()
-        app.run(timeout=30)
+        next(field for field in app.datetime_input if field.label == "Reported at").set_value(datetime(2026, 9, 9, 21, 0))
+        next(field for field in app.datetime_input if field.label == "Resolved at (optional)").set_value(datetime(2026, 9, 9, 21, 5))
+        next(button for button in app.button if button.label == "Save").click().run()
         assert not app.exception
         tickets, activities = database_handles()
-        saved = tickets.get_all_records()
-        assert len(saved) == 1
-        assert saved[0]["Requester Type"] == "External Clients"
-        assert saved[0]["Requester Name"] == ""
-        assert saved[0]["Job Request ID"] == job_id
-        assert saved[0]["Reg No"] == reg_no.upper()
-        assert saved[0]["Office Department"] == ""
-        assert saved[0]["Status"] == "to do"
-        assert saved[0]["Created"]
-        assert saved[0]["Reported At"] == "2026-09-09T21:00:00+03:00"
-        assert pd.Timestamp(saved[0]["Created"]) > pd.Timestamp(saved[0]["Reported At"])
-        assert any(row["Note"] == "External Clients via Call" for row in activities.get_all_records())
-        # A real response before dashboard entry is valid when after reporting.
-        next(field for field in app.datetime_input if field.label == "First response sent at").set_value(datetime(2026, 9, 9, 21, 20))
-        next(button for button in app.button if button.label == "Save request update").click()
-        app.run(timeout=30)
-        assert not app.exception
-        assert tickets.get_all_records()[0]["First Response At"] == "2026-09-09T21:20:00+03:00"
+        saved, = tickets.get_all_records()
+        assert saved["Requester Type"] == "External Clients"
+        assert saved["Job Request ID"] == job_id
+        assert saved["Reg No"] == reg_no.upper()
+        assert saved["Status"] == "closed"
+        assert saved["Reported At"] == "2026-09-09T21:00:00+03:00"
+        assert saved["Closed At"] == saved["Resolved At"] == "2026-09-09T21:05:00+03:00"
+        assert pd.Timestamp(saved["Created"]) > pd.Timestamp(saved["Reported At"])
+        assert activities.get_all_records() == []
+        register = next(table for table in tables if "Reg No / Request ID" in table.columns)
+        assert register.iloc[0]["Ticket"] == "T-001"
+        assert register.iloc[0]["Reg No / Request ID"] == " / ".join(filter(None, (reg_no.upper(), job_id)))
+        assert "Requester" not in register.columns
     finally:
         st.cache_resource.clear()

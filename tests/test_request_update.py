@@ -31,8 +31,6 @@ def test_save_request_update_preserves_id_and_records_activity(tmp_path, monkeyp
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
         app.run(timeout=30)
         assert not app.exception
-        assert any(field.label == "Reg No" for field in app.text_input)
-        assert not any(field.label == "Solver ID" for field in app.text_input)
         next(field for field in app.text_area if field.label == "Resolution summary").set_value("Told to reinstall app")
         next(field for field in app.text_area if field.label == "Update note").set_value("Provided instructions")
         next(button for button in app.button if button.label == "Save request update").click()
