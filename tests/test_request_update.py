@@ -20,6 +20,7 @@ def test_save_request_update_preserves_id_and_records_activity(tmp_path, monkeyp
     ticket = dict.fromkeys(TICKET_HEADERS, "")
     ticket.update({
         "Ticket ID": "request-1",
+        "Assigned Department": "IT",
         "Summary": "App will not open",
         "Status": "to do",
         "Priority": "Medium",
@@ -35,6 +36,7 @@ def test_save_request_update_preserves_id_and_records_activity(tmp_path, monkeyp
         app.session_state["editing_ticket_id"] = "request-1"
         app.run(timeout=30)
         assert not app.exception
+        assert not any(section.label == "Department routing" for section in app.expander)
         next(field for field in app.text_area if field.label == "Resolution summary").set_value("Told to reinstall app")
         next(field for field in app.text_area if field.label == "Update note").set_value("Provided instructions")
         next(button for button in app.button if button.label == "Save request update").click()

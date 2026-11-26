@@ -971,13 +971,15 @@ def edit_ticket_dialog(selected, ticket_label):
     if not can_manage_selected:
         st.info("This request is owned by another department. You have view-only access and can add a note below.")
 
-    with st.expander("Department routing"):
-        current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
-        new_department = st.selectbox(
-            "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
-            key=f"{form_key}_department", disabled=not can_manage_selected,
-            help="Reassign this request to another department. Choosing a department with sub-teams requires selecting one below.",
-        )
+    current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+    new_department = current_dept
+    if can_manage_selected and current_dept != "IT":
+        with st.expander("Department routing"):
+            new_department = st.selectbox(
+                "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
+                key=f"{form_key}_department",
+                help="Reassign this request to another department.",
+            )
 
     with st.form(form_key, enter_to_submit=False):
         issue = st.text_input("Issue summary", value=normalize_text(selected["Summary"]))
