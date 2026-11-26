@@ -75,6 +75,7 @@ def test_ticket_cards_filter_the_register(tmp_path, monkeypatch):
             tables.clear()
             app.button(key=f"ticket_card_{card}").click().run()
             assert not app.exception
+            assert app.session_state["dashboard_tab"] == "Tickets"
             table = next(frame for frame in tables if "Reg No / Request ID" in frame.columns)
             assert set(table["Issue"]) == expected
         assert len(tickets.get_all_records()) == 3

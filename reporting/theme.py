@@ -38,19 +38,6 @@ def apply_solvit_theme():
         h1 { font-weight: 800 !important; }
         h2, h3 { font-weight: 700 !important; }
         p, label, [data-testid="stCaptionContainer"] { color: var(--solvit-muted); }
-        .st-key-ticket_cards .stButton > button {
-            min-height: 90px;
-            justify-content: flex-start;
-            text-align: left;
-            padding: 12px 18px;
-        }
-        .st-key-ticket_cards .stButton > button p {
-            font-size: .85rem;
-        }
-        .st-key-ticket_cards .stButton > button strong {
-            font-size: 1.6rem;
-            line-height: 1.4;
-        }
         div[data-testid="stMetric"] {
             background: linear-gradient(180deg, #FFFFFF 0%, #FAFAFA 100%);
             border: 1px solid var(--solvit-border);
@@ -83,6 +70,52 @@ def apply_solvit_theme():
             color: var(--solvit-red) !important;
         }
         .stButton > button[kind="primary"]:hover { color: #FFFFFF !important; filter: brightness(.94); }
+        .st-key-ticket_cards { margin-bottom: .35rem; }
+        .st-key-ticket_cards button,
+        .st-key-ticket_card_tickets button,
+        .st-key-ticket_card_open button,
+        .st-key-ticket_card_resolved button {
+            --card-accent: #475569;
+            --card-tint: #F1F5F9;
+            min-height: 108px !important;
+            padding: 14px 20px 14px 24px !important;
+            justify-content: flex-start !important;
+            text-align: left !important;
+            border: 1px solid #CBD5E1 !important;
+            border-left: 4px solid var(--card-accent) !important;
+            border-radius: 16px !important;
+            background: linear-gradient(120deg, #FFFFFF 65%, var(--card-tint)) !important;
+            color: #0F172A !important;
+            box-shadow: 0 3px 10px rgba(15,23,42,.06) !important;
+        }
+        .st-key-ticket_card_open button { --card-accent: #C6253D; --card-tint: #FFF0F2; }
+        .st-key-ticket_card_resolved button { --card-accent: #08785C; --card-tint: #ECFDF5; }
+        .st-key-ticket_cards button[kind="primary"] {
+            background: linear-gradient(120deg, var(--card-tint), #FFFFFF) !important;
+            border-color: var(--card-accent) !important;
+            color: #0F172A !important;
+        }
+        .st-key-ticket_cards button:hover,
+        .st-key-ticket_cards button:focus-visible {
+            border-color: var(--card-accent) !important;
+            color: #0F172A !important;
+            box-shadow: 0 0 0 2px var(--card-accent) !important;
+            filter: none !important;
+        }
+        .st-key-ticket_cards button p {
+            color: #475569 !important;
+            font-size: .78rem !important;
+            line-height: 1.4 !important;
+            margin: 0 !important;
+            text-align: left !important;
+        }
+        .st-key-ticket_cards button strong {
+            color: #0F172A;
+            font-size: 1.85rem;
+            font-variant-numeric: tabular-nums;
+            font-weight: 800;
+            line-height: 1.25;
+        }
         [data-baseweb="input"] > div, [data-baseweb="select"] > div,
         textarea, [data-testid="stFileUploaderDropzone"] {
             border-radius: 12px !important;

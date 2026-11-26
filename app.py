@@ -662,9 +662,39 @@ def render_live_reporting():
     render_weekly_report(weekly_scope, refreshed_at)
 
 
+closed_tickets = view["Status"].eq("closed")
+active_card = st.session_state.get("ticket_card_filter", "Tickets")
+
+
+def filter_ticket_cards(card):
+    if card != st.session_state.get("ticket_card_filter", "Tickets"):
+        close_ticket_editor()
+        st.session_state["ticket_card_filter"] = card
+    st.session_state["dashboard_tab"] = "Tickets"
+
+
+with st.container(key="ticket_cards"):
+    columns = st.columns(3)
+    cards = [
+        ("Tickets", len(view), "All tickets"),
+        ("Open", int((~closed_tickets).sum()), "Awaiting resolution"),
+        ("Resolved", int(closed_tickets.sum()), "Closed tickets"),
+    ]
+    for column, (card, count, description) in zip(columns, cards):
+        column.button(
+            f"{card}  \n**{count:,}**  \n{description}",
+            key=f"ticket_card_{card.lower()}",
+            type="primary" if active_card == card else "secondary",
+            width="stretch",
+            on_click=filter_ticket_cards,
+            args=(card,),
+            help=f"Show {description.lower()}",
+        )
+
+
 # ---- Tabbed layout ----
 tab_overview, tab_tickets, tab_reports, tab_weekly, tab_admin = st.tabs(
-    ["Overview", "Tickets", "Reports", "Weekly tasks", "Admin"]
+    ["Overview", "Tickets", "Reports", "Weekly tasks", "Admin"], key="dashboard_tab", on_change="rerun",
 )
 
 with tab_overview:
@@ -1253,27 +1283,10 @@ with tab_tickets:
 
     ticket_ids = df.sort_values(["Created_dt", "Ticket ID"], na_position="first")["Ticket ID"]
     ticket_labels = {ticket_id: f"T-{number:03d}" for number, ticket_id in enumerate(ticket_ids, start=1)}
-    closed = view["Status"].eq("closed")
-    active_card = st.session_state.get("ticket_card_filter", "Tickets")
-
-    def filter_ticket_cards(card):
-        if card != st.session_state.get("ticket_card_filter", "Tickets"):
-            close_ticket_editor()
-            st.session_state["ticket_card_filter"] = card
-
-    with st.container(key="ticket_cards"):
-        columns = st.columns(3)
-        cards = [("Tickets", len(view)), ("Open", int((~closed).sum())), ("Resolved", int(closed.sum()))]
-        for column, (card, count) in zip(columns, cards):
-            column.button(f"{card}  \n**{count:,}**", key=f"ticket_card_{card.lower()}",
-                          type="primary" if active_card == card else "secondary", width="stretch",
-                          on_click=filter_ticket_cards, args=(card,),
-                          help=f"Show {'all tickets' if card == 'Tickets' else card.lower() + ' tickets'}")
-
     if active_card == "Open":
-        editor_df = view.loc[~closed]
+        editor_df = view.loc[~closed_tickets]
     elif active_card == "Resolved":
-        editor_df = view.loc[closed]
+        editor_df = view.loc[closed_tickets]
     else:
         editor_df = view
 
