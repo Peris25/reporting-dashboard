@@ -51,25 +51,35 @@ def enrich_tickets(df, diagnosis_target=DIAGNOSIS_SLA_HOURS, resolution_target=C
             result[field] = ""
     result["Created_dt"] = pd.to_datetime(result["Created"], errors="coerce", utc=True)
     result["Created Month"] = result["Created_dt"].dt.tz_convert("Africa/Nairobi").dt.strftime("%Y-%m")
+    current = parse_datetime(now or datetime.now().astimezone())
+    reported = result.get("Reported At", pd.Series("", index=result.index))
+    start = pd.to_datetime(
+        reported.where(reported.notna() & reported.astype(str).str.strip().ne(""), result["Created"]),
+        errors="coerce", utc=True, format="mixed",
+    )
+    result["Reported_dt"] = start
+    closed = result["Status"].astype(str).str.strip().str.lower().eq("closed")
+    open_age = (current - start).dt.total_seconds().div(3600)
     for label, field, target in [
         ("Response", "First Response At", response_target),
         ("Diagnosis", "Diagnosed At", diagnosis_target),
         ("Closure", "Closed At", resolution_target),
     ]:
-        result[f"{label} Hours"] = pd.Series([
-            elapsed_hours(reported_time(row), row[field]) for _, row in result.iterrows()
-        ], index=result.index, dtype=float)
-        result[f"{label} SLA"] = pd.Series([
-            "Not recorded" if str(row["Status"]).strip().lower() == "closed" and not str(row[field]).strip()
-            else classify_sla(reported_time(row), row[field], target, now)
-            for _, row in result.fillna("").iterrows()
-        ], index=result.index, dtype=str)
-    # Retain export compatibility, with resolution now measured through closure.
+        recorded = result[field].notna() & result[field].astype(str).str.strip().ne("")
+        end = pd.to_datetime(result[field], errors="coerce", utc=True, format="mixed")
+        elapsed = (end - start).dt.total_seconds().div(3600)
+        result[f"{label} Hours"] = elapsed.where(elapsed.ge(0))
+        effective_hours = elapsed.where(end.notna(), open_age)
+        outcome = pd.Series("Within SLA", index=result.index, dtype=str)
+        outcome = outcome.mask(end.isna(), "Pending")
+        outcome = outcome.mask(effective_hours.gt(target), "Breached")
+        outcome = outcome.mask(effective_hours.lt(0) | (recorded & end.isna()), "Invalid")
+        outcome = outcome.mask(start.isna(), "Unknown")
+        result[f"{label} SLA"] = outcome.mask(closed & ~recorded, "Not recorded")
+
     result["Resolution Hours"] = result["Closure Hours"]
     result["Resolution SLA"] = result["Closure SLA"]
-    current = parse_datetime(now or datetime.now().astimezone())
-    result["Reported_dt"] = pd.to_datetime(pd.Series([reported_time(row) for _, row in result.iterrows()], index=result.index, dtype=str), errors="coerce", utc=True, format="mixed")
-    result["Open Hours"] = (current - result["Reported_dt"]).dt.total_seconds().div(3600).clip(lower=0)
+    result["Open Hours"] = open_age.clip(lower=0)
     result.loc[result["Status"].eq("closed"), "Open Hours"] = float("nan")
     result["Age Days"] = result["Open Hours"].div(24).round(1)
     return result

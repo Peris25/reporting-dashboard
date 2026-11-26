@@ -6,7 +6,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from reporting.analytics import ALL_REQUESTERS_OPTION, filter_requests
-from reporting.database import database_handles
+from reporting.database import DatabaseWorksheet, database_handles
 from reporting.schema import TICKET_HEADERS
 
 
@@ -57,6 +57,14 @@ def test_app_renders_five_tabs_and_new_sidebar(tmp_path, monkeypatch):
                    "Summary": "App issue", "Status": "to do", "Priority": "Medium",
                    "Requester Type": "Solver", "Assigned Department": "IT", "Callback Required": "No"})
     tickets.append_row([ticket[field] for field in TICKET_HEADERS])
+    reads = []
+    original_read = DatabaseWorksheet.get_all_records
+
+    def count_read(worksheet):
+        reads.append(worksheet.headers)
+        return original_read(worksheet)
+
+    monkeypatch.setattr(DatabaseWorksheet, "get_all_records", count_read)
     try:
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=30)
         assert not app.exception
@@ -65,8 +73,15 @@ def test_app_renders_five_tabs_and_new_sidebar(tmp_path, monkeypatch):
         select_labels = [box.label for box in app.selectbox]
         assert "Reporting period" in select_labels
         assert "Request status" in select_labels
-        # The headline overview cards and the detailed analytics both render.
+        assert reads == [TICKET_HEADERS]
+        assert not any("Analytics refresh every 10 minutes" in caption.value for caption in app.caption)
+        assert not any(heading.value == "Weekly tasks" for heading in app.subheader)
         assert any("Tickets in period" in str(markdown.value) for markdown in app.markdown)
+        reads.clear()
+        app.session_state["dashboard_tab"] = "Reports"
+        app.run(timeout=30)
+        assert not app.exception
+        assert reads == [TICKET_HEADERS]
         assert any("Analytics refresh every 10 minutes" in caption.value for caption in app.caption)
     finally:
         st.cache_resource.clear()

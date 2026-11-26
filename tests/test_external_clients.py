@@ -22,6 +22,7 @@ def test_external_client_intake_accepts_optional_job_details(tmp_path, monkeypat
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30).run()
         assert not app.exception
         assert "New request" not in [tab.label for tab in app.tabs]
+        app.button(key="ticket_card_tickets").click().run()
         next(button for button in app.button if button.label == "Add new").click().run()
         next(field for field in app.selectbox if field.label == "Who needs support?").set_value("External Clients").run()
         assert not any(field.label == "Solver ID" for field in app.text_input)

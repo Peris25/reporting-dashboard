@@ -121,11 +121,10 @@ def get_sheet_handles():
 
 
 def ensure_headers(ws, expected_headers):
-    values = ws.get_all_values()
-    if not values:
+    header = ws.row_values(1)
+    if not header:
         ws.append_row(expected_headers)
         return
-    header = values[0]
     if header == expected_headers:
         return
     # Safely extend the previous schema without rearranging existing columns.
@@ -425,8 +424,6 @@ def status_donut(view):
 
 # ---- App ----
 ws, activity_ws = get_sheet_handles()
-ensure_headers(ws, REQUIRED_HEADERS)
-ensure_headers(activity_ws, ACTIVITY_HEADERS)
 
 OPEN_ADMIN = CurrentUser(username="dashboard-user", display_name="Dashboard user",
                          department=GLOBAL_VIEW_DEPARTMENT, role="admin")
@@ -436,7 +433,7 @@ if USE_DATABASE:
     # Require named-account login only once auth is set up (accounts seeded or a
     # bootstrap admin configured). Until then the tool stays open as an IT admin,
     # matching its pre-roles default so existing deployments are never locked out.
-    if bool(BOOTSTRAP_ADMIN_USER) or user_store.count() > 0:
+    if st.session_state.get("account") or BOOTSTRAP_ADMIN_USER or user_store.count() > 0:
         current_user = require_account_login(user_store)
     else:
         current_user = OPEN_ADMIN
@@ -444,6 +441,8 @@ else:
     # Google Sheets fallback keeps the legacy shared-password gate and treats the
     # single user as an IT admin, matching the tool's pre-roles behaviour.
     require_login()
+    ensure_headers(ws, REQUIRED_HEADERS)
+    ensure_headers(activity_ws, ACTIVITY_HEADERS)
     current_user = OPEN_ADMIN
 
 is_admin_user = current_user.is_admin  # may manage any request and delete
@@ -456,6 +455,7 @@ render_dashboard_hero()
 # department feel at home (IT sees "IT Support", HR sees "HR Support", etc.).
 render_sidebar_header(f"{current_user.department} Support")
 
+refreshed_at = pd.Timestamp.now(tz="UTC")
 df = read_df(ws, REQUIRED_HEADERS)
 
 # ---- Normalize main data ----
@@ -467,7 +467,7 @@ df["Diagnosed At"] = df["Diagnosed At"].astype(str).str.strip()
 df["Resolved At"] = df["Resolved At"].astype(str).str.strip()
 df["Updated At"] = df["Updated At"].astype(str).str.strip()
 
-df = normalize_department_columns(enrich_tickets(df, DIAGNOSIS_SLA_HOURS, RESOLUTION_SLA_HOURS))
+df = normalize_department_columns(enrich_tickets(df, DIAGNOSIS_SLA_HOURS, RESOLUTION_SLA_HOURS, now=refreshed_at))
 
 # Scope every request to what this user may see before any in-page filtering.
 scoped_df = visible_tickets(df, department=current_user.department, admin=view_all_user)
@@ -545,27 +545,15 @@ view = filter_requests(
 )
 
 
-def _live_view():
-    """Re-read and filter the data the same way, for the auto-refreshing tabs."""
-    refreshed_at = pd.Timestamp.now(tz="UTC")
-    fresh = read_df(ws, REQUIRED_HEADERS)
-    for field in ["Status", "Summary", "Priority", "Assignee"]:
-        fresh[field] = fresh[field].fillna("").astype(str).str.strip()
-    fresh["Status"] = fresh["Status"].str.lower()
-    live_df = normalize_department_columns(enrich_tickets(fresh, now=refreshed_at))
-    live_role = visible_tickets(live_df, department=current_user.department, admin=view_all_user)
-    live_view = filter_requests(
-        live_role, status_filter, priority_filter, month_filter, owner_filter, search,
-        department_filter, subteam_filter, requester_type=workspace,
-        period_start=period_start, period_end=period_end,
-    )
-    return refreshed_at, live_role, live_view
-
-
 @st.fragment(run_every="10m")
+def refresh_analytics():
+    if pd.Timestamp.now(tz="UTC") - refreshed_at >= pd.Timedelta(minutes=10):
+        st.rerun()
+
+
 def render_overview():
     st.button("Refresh overview", key="refresh_overview")
-    refreshed_at, _live_role, live_view = _live_view()
+    live_view = view
     closed_mask = live_view["Status"].eq("closed")
     open_df = live_view.loc[~closed_mask]
     overdue = overdue_milestones(open_df).any(axis=1) if len(open_df) else pd.Series(dtype=bool)
@@ -597,10 +585,10 @@ def render_overview():
     st.caption(f"Auto-refreshes every 10 minutes. Last updated {refreshed_at.tz_convert('Africa/Nairobi'):%H:%M:%S} Nairobi time.")
 
 
-@st.fragment(run_every="10m")
 def render_live_reporting():
     st.button("Refresh analytics now", key="refresh_analytics")
-    refreshed_at, live_role, live_view = _live_view()
+    live_view = view
+    live_role = scoped_df
     # The weekly comparison ignores the in-page filters but keeps the department scope.
     weekly_scope = filter_requests(live_role, department=department_filter, subteam=subteam_filter)
     st.caption(f"Analytics refresh every 10 minutes. Last updated {refreshed_at.tz_convert('Africa/Nairobi'):%H:%M:%S} Nairobi time.")
@@ -697,171 +685,176 @@ tab_overview, tab_tickets, tab_reports, tab_weekly, tab_admin = st.tabs(
     ["Overview", "Tickets", "Reports", "Weekly tasks", "Admin"], key="dashboard_tab", on_change="rerun",
 )
 
-with tab_overview:
-    render_overview()
+if tab_overview.open:
+    with tab_overview:
+        refresh_analytics()
+        render_overview()
 
-with tab_reports:
-    render_live_reporting()
+if tab_reports.open:
+    with tab_reports:
+        refresh_analytics()
+        render_live_reporting()
 
-with tab_weekly:
-    # Actions from the Weekly Manager Tracker, due at the Thursday review meeting.
-    # Tracked separately from support requests so they never affect SLA metrics.
-    st.subheader("Weekly tasks")
-    st.caption(
-        "Actions from the Weekly Manager Tracker, due at the Thursday review meeting. "
-        "Tracked separately from support requests, so they never affect the SLA metrics."
-    )
-    if not USE_DATABASE:
-        st.info("Weekly tasks require the PostgreSQL database backend.")
-    else:
-        weekly_store = get_weekly_task_store()
-        if view_all_user:
-            weekly_graph = GraphConfig.from_settings(setting)
-            weekly_ready = weekly_graph.is_configured() and bool(TRACKER_SHARE_URL)
-            backfill = st.checkbox(
-                "Import all weeks (one-time backfill)", key="weekly_backfill",
-                help="Fetch every filled week from the tracker, not just the current one. "
-                     "Use this once to load history; after that the weekly sync keeps up.",
-            )
-            sync_col, hint_col = st.columns([1, 2])
-            sync_label = "Import all weeks" if backfill else "Sync weekly tasks"
-            if sync_col.button(sync_label, disabled=not weekly_ready, key="sync_weekly"):
-                try:
-                    with st.spinner("Reading the tracker and updating weekly tasks…"):
-                        weekly_summary = sync_weekly_tasks(
-                            weekly_store, graph_config=weekly_graph,
-                            share_url=TRACKER_SHARE_URL, worksheet=TRACKER_WORKSHEET,
-                            all_weeks=backfill,
-                        )
-                    if weekly_summary["tasks"]:
-                        scope = (
-                            f"{weekly_summary['weeks']} week(s)" if backfill
-                            else f"{weekly_summary['week']} (due {weekly_summary['due']})"
-                        )
-                        st.success(f"{scope}: {weekly_summary['created']} new, {weekly_summary['updated']} updated.")
-                        st.rerun()
-                    else:
-                        st.error(
-                            "Nothing to fetch: the tracker has no tasks filled in "
-                            + ("for any week yet." if backfill else "for this week yet.")
-                        )
-                except Exception as error:
-                    st.error(f"Sync failed: {error}")
-            if not weekly_ready:
-                hint_col.caption("Set the MS_* Graph secrets and TRACKER_SHARE_URL to enable live sync.")
-
-        all_weekly = weekly_store.list()
-        if not all_weekly:
-            st.caption("No weekly tasks yet. An admin can sync them from the tracker.")
+if tab_weekly.open:
+    with tab_weekly:
+        # Actions from the Weekly Manager Tracker, due at the Thursday review meeting.
+        # Tracked separately from support requests so they never affect SLA metrics.
+        st.subheader("Weekly tasks")
+        st.caption(
+            "Actions from the Weekly Manager Tracker, due at the Thursday review meeting. "
+            "Tracked separately from support requests, so they never affect the SLA metrics."
+        )
+        if not USE_DATABASE:
+            st.info("Weekly tasks require the PostgreSQL database backend.")
         else:
-            # The store returns every week, newest first; let the user browse any of them.
-            week_labels = {}
-            for task in all_weekly:
-                week_labels.setdefault(task["week_start"], task["week_label"] or task["week_start"])
-            week_options = list(week_labels)
-            picked_week = st.selectbox(
-                "Week", week_options, format_func=lambda w: week_labels[w], key="weekly_week_pick",
-            )
-            week_tasks = [task for task in all_weekly if task["week_start"] == picked_week]
-            visible_tasks = [
-                task for task in week_tasks
-                if view_all_user or normalize_department(task["department"]) == current_user.department
-            ]
-            label = week_tasks[0]["week_label"] or picked_week
-            due = week_tasks[0]["due_at"] or ""
-            done = sum(1 for task in visible_tasks if task["status"] == WEEKLY_STATUSES[-1])
-            st.caption(f"{label}  ·  due {due}  ·  {done}/{len(visible_tasks)} complete in your view")
-            if not visible_tasks:
-                st.caption("No weekly tasks routed to your department this week.")
+            weekly_store = get_weekly_task_store()
+            if view_all_user:
+                weekly_graph = GraphConfig.from_settings(setting)
+                weekly_ready = weekly_graph.is_configured() and bool(TRACKER_SHARE_URL)
+                backfill = st.checkbox(
+                    "Import all weeks (one-time backfill)", key="weekly_backfill",
+                    help="Fetch every filled week from the tracker, not just the current one. "
+                         "Use this once to load history; after that the weekly sync keeps up.",
+                )
+                sync_col, hint_col = st.columns([1, 2])
+                sync_label = "Import all weeks" if backfill else "Sync weekly tasks"
+                if sync_col.button(sync_label, disabled=not weekly_ready, key="sync_weekly"):
+                    try:
+                        with st.spinner("Reading the tracker and updating weekly tasks…"):
+                            weekly_summary = sync_weekly_tasks(
+                                weekly_store, graph_config=weekly_graph,
+                                share_url=TRACKER_SHARE_URL, worksheet=TRACKER_WORKSHEET,
+                                all_weeks=backfill,
+                            )
+                        if weekly_summary["tasks"]:
+                            scope = (
+                                f"{weekly_summary['weeks']} week(s)" if backfill
+                                else f"{weekly_summary['week']} (due {weekly_summary['due']})"
+                            )
+                            st.success(f"{scope}: {weekly_summary['created']} new, {weekly_summary['updated']} updated.")
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Nothing to fetch: the tracker has no tasks filled in "
+                                + ("for any week yet." if backfill else "for this week yet.")
+                            )
+                    except Exception as error:
+                        st.error(f"Sync failed: {error}")
+                if not weekly_ready:
+                    hint_col.caption("Set the MS_* Graph secrets and TRACKER_SHARE_URL to enable live sync.")
+
+            all_weekly = weekly_store.list()
+            if not all_weekly:
+                st.caption("No weekly tasks yet. An admin can sync them from the tracker.")
             else:
-                # Weekly tasks get their own analysis, kept apart from ticket SLA metrics.
-                stats = completion_stats(visible_tasks)
-                render_kpi_cards([
-                    ("Completion rate", f"{stats['rate']:.0f}%", "Complete ÷ tasks this week", "#10B981"),
-                    ("Complete", stats["complete"], f"of {stats['total']} tasks", "#3B82F6"),
-                    ("Off track", stats["off_track"], "Flagged at risk", "#ff353e"),
-                    ("Not started", stats["not_started"], "Yet to begin", "#F59E0B"),
-                ])
-                visible_all_weekly = [
-                    task for task in all_weekly
+                # The store returns every week, newest first; let the user browse any of them.
+                week_labels = {}
+                for task in all_weekly:
+                    week_labels.setdefault(task["week_start"], task["week_label"] or task["week_start"])
+                week_options = list(week_labels)
+                picked_week = st.selectbox(
+                    "Week", week_options, format_func=lambda w: week_labels[w], key="weekly_week_pick",
+                )
+                week_tasks = [task for task in all_weekly if task["week_start"] == picked_week]
+                visible_tasks = [
+                    task for task in week_tasks
                     if view_all_user or normalize_department(task["department"]) == current_user.department
                 ]
-                analysis_cols = st.columns(2)
-                with analysis_cols[0]:
-                    if view_all_user:
-                        st.markdown("###### Completion by department")
-                        dep_data = [
-                            {"Department": row["department"], "Completion %": round(row["rate"], 1),
-                             "Complete": row["complete"], "Total": row["total"]}
-                            for row in completion_by_department(week_tasks)
-                        ]
-                        st.altair_chart(
-                            alt.Chart(alt.Data(values=dep_data)).mark_bar(cornerRadiusEnd=4).encode(
-                                x=alt.X("Completion %:Q", scale=alt.Scale(domain=[0, 100])),
-                                y=alt.Y("Department:N", sort="-x", title=None),
-                                color=alt.value("#3B82F6"),
-                                tooltip=["Department:N", "Completion %:Q", "Complete:Q", "Total:Q"],
-                            ).properties(height=max(140, 34 * len(dep_data))).configure_view(strokeWidth=0),
-                            width="stretch",
+                label = week_tasks[0]["week_label"] or picked_week
+                due = week_tasks[0]["due_at"] or ""
+                done = sum(1 for task in visible_tasks if task["status"] == WEEKLY_STATUSES[-1])
+                st.caption(f"{label}  ·  due {due}  ·  {done}/{len(visible_tasks)} complete in your view")
+                if not visible_tasks:
+                    st.caption("No weekly tasks routed to your department this week.")
+                else:
+                    # Weekly tasks get their own analysis, kept apart from ticket SLA metrics.
+                    stats = completion_stats(visible_tasks)
+                    render_kpi_cards([
+                        ("Completion rate", f"{stats['rate']:.0f}%", "Complete ÷ tasks this week", "#10B981"),
+                        ("Complete", stats["complete"], f"of {stats['total']} tasks", "#3B82F6"),
+                        ("Off track", stats["off_track"], "Flagged at risk", "#ff353e"),
+                        ("Not started", stats["not_started"], "Yet to begin", "#F59E0B"),
+                    ])
+                    visible_all_weekly = [
+                        task for task in all_weekly
+                        if view_all_user or normalize_department(task["department"]) == current_user.department
+                    ]
+                    analysis_cols = st.columns(2)
+                    with analysis_cols[0]:
+                        if view_all_user:
+                            st.markdown("###### Completion by department")
+                            dep_data = [
+                                {"Department": row["department"], "Completion %": round(row["rate"], 1),
+                                 "Complete": row["complete"], "Total": row["total"]}
+                                for row in completion_by_department(week_tasks)
+                            ]
+                            st.altair_chart(
+                                alt.Chart(alt.Data(values=dep_data)).mark_bar(cornerRadiusEnd=4).encode(
+                                    x=alt.X("Completion %:Q", scale=alt.Scale(domain=[0, 100])),
+                                    y=alt.Y("Department:N", sort="-x", title=None),
+                                    color=alt.value("#3B82F6"),
+                                    tooltip=["Department:N", "Completion %:Q", "Complete:Q", "Total:Q"],
+                                ).properties(height=max(140, 34 * len(dep_data))).configure_view(strokeWidth=0),
+                                width="stretch",
+                            )
+                        else:
+                            st.markdown("###### Status mix")
+                            mix = [
+                                {"Status": status, "Tasks": sum(
+                                    1 for task in visible_tasks
+                                    if (task["status"] if task["status"] in WEEKLY_STATUSES else WEEKLY_STATUSES[0]) == status)}
+                                for status in WEEKLY_STATUSES
+                            ]
+                            st.altair_chart(
+                                alt.Chart(alt.Data(values=mix)).mark_arc(innerRadius=55).encode(
+                                    theta="Tasks:Q",
+                                    color=alt.Color("Status:N", scale=alt.Scale(
+                                        domain=WEEKLY_STATUSES, range=["#F59E0B", "#3B82F6", "#ff353e", "#10B981"]),
+                                        legend=alt.Legend(title=None, orient="bottom")),
+                                    tooltip=["Status:N", "Tasks:Q"],
+                                ).properties(height=240).configure_view(strokeWidth=0),
+                                width="stretch",
+                            )
+                    with analysis_cols[1]:
+                        st.markdown("###### Completion rate over weeks")
+                        trend = completion_by_week(visible_all_weekly)
+                        if len(trend) < 2:
+                            st.caption("Backfill more weeks to see a trend.")
+                        else:
+                            order = [row["week_label"] for row in trend]
+                            trend_data = [
+                                {"Week": row["week_label"], "Completion %": round(row["rate"], 1),
+                                 "Complete": row["complete"], "Total": row["total"]}
+                                for row in trend
+                            ]
+                            st.altair_chart(
+                                alt.Chart(alt.Data(values=trend_data)).mark_line(point=True).encode(
+                                    x=alt.X("Week:N", sort=order, title=None),
+                                    y=alt.Y("Completion %:Q", scale=alt.Scale(domain=[0, 100])),
+                                    color=alt.value("#10B981"),
+                                    tooltip=["Week:N", "Completion %:Q", "Complete:Q", "Total:Q"],
+                                ).properties(height=240).configure_view(strokeWidth=0),
+                                width="stretch",
+                            )
+                    st.divider()
+                for task in visible_tasks:
+                    with st.container(border=True):
+                        heading = f"**{task['kpi_area']}**  ·  {task['department'] or 'Unrouted'}"
+                        if task["subteam"]:
+                            heading += f" / {task['subteam']}"
+                        st.markdown(heading)
+                        st.write(task["task"])
+                        if task["comments"]:
+                            st.caption(f"Notes from the tracker: {task['comments']}")
+                        can_edit_task = view_all_user or normalize_department(task["department"]) == current_user.department
+                        status_value = task["status"] if task["status"] in WEEKLY_STATUSES else WEEKLY_STATUSES[0]
+                        new_status = st.selectbox(
+                            "Status", WEEKLY_STATUSES, index=WEEKLY_STATUSES.index(status_value),
+                            key=f"weekly_status_{task['task_id']}", disabled=not can_edit_task,
                         )
-                    else:
-                        st.markdown("###### Status mix")
-                        mix = [
-                            {"Status": status, "Tasks": sum(
-                                1 for task in visible_tasks
-                                if (task["status"] if task["status"] in WEEKLY_STATUSES else WEEKLY_STATUSES[0]) == status)}
-                            for status in WEEKLY_STATUSES
-                        ]
-                        st.altair_chart(
-                            alt.Chart(alt.Data(values=mix)).mark_arc(innerRadius=55).encode(
-                                theta="Tasks:Q",
-                                color=alt.Color("Status:N", scale=alt.Scale(
-                                    domain=WEEKLY_STATUSES, range=["#F59E0B", "#3B82F6", "#ff353e", "#10B981"]),
-                                    legend=alt.Legend(title=None, orient="bottom")),
-                                tooltip=["Status:N", "Tasks:Q"],
-                            ).properties(height=240).configure_view(strokeWidth=0),
-                            width="stretch",
-                        )
-                with analysis_cols[1]:
-                    st.markdown("###### Completion rate over weeks")
-                    trend = completion_by_week(visible_all_weekly)
-                    if len(trend) < 2:
-                        st.caption("Backfill more weeks to see a trend.")
-                    else:
-                        order = [row["week_label"] for row in trend]
-                        trend_data = [
-                            {"Week": row["week_label"], "Completion %": round(row["rate"], 1),
-                             "Complete": row["complete"], "Total": row["total"]}
-                            for row in trend
-                        ]
-                        st.altair_chart(
-                            alt.Chart(alt.Data(values=trend_data)).mark_line(point=True).encode(
-                                x=alt.X("Week:N", sort=order, title=None),
-                                y=alt.Y("Completion %:Q", scale=alt.Scale(domain=[0, 100])),
-                                color=alt.value("#10B981"),
-                                tooltip=["Week:N", "Completion %:Q", "Complete:Q", "Total:Q"],
-                            ).properties(height=240).configure_view(strokeWidth=0),
-                            width="stretch",
-                        )
-                st.divider()
-            for task in visible_tasks:
-                with st.container(border=True):
-                    heading = f"**{task['kpi_area']}**  ·  {task['department'] or 'Unrouted'}"
-                    if task["subteam"]:
-                        heading += f" / {task['subteam']}"
-                    st.markdown(heading)
-                    st.write(task["task"])
-                    if task["comments"]:
-                        st.caption(f"Notes from the tracker: {task['comments']}")
-                    can_edit_task = view_all_user or normalize_department(task["department"]) == current_user.department
-                    status_value = task["status"] if task["status"] in WEEKLY_STATUSES else WEEKLY_STATUSES[0]
-                    new_status = st.selectbox(
-                        "Status", WEEKLY_STATUSES, index=WEEKLY_STATUSES.index(status_value),
-                        key=f"weekly_status_{task['task_id']}", disabled=not can_edit_task,
-                    )
-                    if can_edit_task and new_status != task["status"]:
-                        weekly_store.set_status(task["task_id"], new_status)
-                        st.rerun()
+                        if can_edit_task and new_status != task["status"]:
+                            weekly_store.set_status(task["task_id"], new_status)
+                            st.rerun()
 
 def close_ticket_intake():
     st.session_state.pop("ticket_intake_open", None)
@@ -1252,21 +1245,23 @@ def edit_ticket_dialog(selected, ticket_label):
             st.success("Note added.")
             st.rerun()
 
-    with st.expander("Ticket history"):
-        activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
-        history = request_history(activity_df, selected_ticket_id)
-        for entry in history:
-            stamp = pd.to_datetime(entry["timestamp"], errors="coerce", utc=True)
-            if pd.notna(stamp):
-                stamp = stamp.tz_convert("Africa/Nairobi")
-            when = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date unavailable"
-            with st.container(border=True):
-                st.markdown(f"**{entry['title']}**")
-                st.caption(when)
-                for detail in entry["details"]:
-                    st.text(detail)
-        if not history:
-            st.caption("No updates recorded for this request yet.")
+    history_section = st.expander("Ticket history", key=f"{form_key}_history", on_change="rerun")
+    if history_section.open:
+        with history_section:
+            activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
+            history = request_history(activity_df, selected_ticket_id)
+            for entry in history:
+                stamp = pd.to_datetime(entry["timestamp"], errors="coerce", utc=True)
+                if pd.notna(stamp):
+                    stamp = stamp.tz_convert("Africa/Nairobi")
+                when = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date unavailable"
+                with st.container(border=True):
+                    st.markdown(f"**{entry['title']}**")
+                    st.caption(when)
+                    for detail in entry["details"]:
+                        st.text(detail)
+            if not history:
+                st.caption("No updates recorded for this request yet.")
 
 
 with tab_tickets:
@@ -1334,273 +1329,275 @@ with tab_tickets:
         else:
             edit_ticket_dialog(matches.iloc[0], ticket_labels[editing_id])
 
-with tab_admin:
-    if can_delete(admin=is_admin_user) and not view.empty:
-        with st.expander("Delete tickets"):
-            render_ticket_deletion(view)
+if tab_admin.open:
+    with tab_admin:
+        if can_delete(admin=is_admin_user) and not view.empty:
+            with st.expander("Delete tickets"):
+                render_ticket_deletion(view)
 
-    # ---- WhatsApp intake ----
-    if USE_DATABASE:
-        # Reuse the connection pool without caching a store instance across app updates.
-        draft_store = DraftStore(ws.session_factory)
-        with st.expander("Import from WhatsApp"):
-            st.caption(
-                "Upload an exported WhatsApp chat (.txt or .zip), choose a date range, and scan it. "
-                "Genuine issues (complaints, app misbehaviour, improvement suggestions) become draft "
-                "requests you review below. Routine chatter (approvals, dispatch, logbooks) is ignored. "
-                + ("AI extraction is on." if OPENAI_API_KEY else "No OpenAI key set, so a keyword fallback is used (lower quality).")
-            )
-            wa_upload = st.file_uploader("WhatsApp chat export", type=["txt", "zip"], key="whatsapp_import")
-            if wa_upload is not None:
-                messages = parse_whatsapp_cached(wa_upload.getvalue(), wa_upload.name)
-                convo = [m for m in messages if not m["system"] and m["sender"]]
-                stamps = [s for s in (parse_timestamp(m["timestamp"]) for m in convo if m["timestamp"]) if pd.notna(s)]
-                if not stamps:
-                    st.warning("No dated messages were found. Export the chat without media and try again.")
-                else:
-                    min_date, max_date = min(stamps).date(), max(stamps).date()
-                    st.caption(f"Chat spans {min_date:%d %b %Y} to {max_date:%d %b %Y} ({len(convo)} messages).")
-                    default_start = max(min_date, max_date - timedelta(days=7))
-                    range_left, range_right = st.columns(2)
-                    start_date = range_left.date_input("From", value=default_start, min_value=min_date, max_value=max_date, key="wa_from")
-                    end_date = range_right.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key="wa_to")
-                    if start_date > end_date:
-                        st.error("The 'From' date must be on or before the 'To' date.")
-                    else:
-                        windowed = [
-                            m for m in convo
-                            if (ts := parse_timestamp(m["timestamp"])) is not None and pd.notna(ts)
-                            and start_date <= ts.date() <= end_date
-                        ]
-                        st.caption(f"{len(windowed)} messages in the selected range.")
-                        if len(windowed) > 3000:
-                            st.warning("That is a large range. Narrow the dates to keep the scan fast and within API limits.")
-                        if st.button("Scan range for issues", key="scan_whatsapp", disabled=not windowed):
-                            with st.spinner("Reading messages and drafting issues…"):
-                                issues = extract_issues(
-                                    windowed, categories=INTAKE_CATEGORIES,
-                                    api_key=OPENAI_API_KEY or None, model=OPENAI_MODEL,
-                                )
-                                known = draft_store.fingerprints()
-                                added = 0
-                                for issue in issues:
-                                    if issue["source_fingerprint"] in known:
-                                        continue
-                                    draft_store.add({
-                                        **issue, "source": "whatsapp",
-                                        "source_reference": f"{wa_upload.name} [{start_date}..{end_date}]",
-                                    })
-                                    known.add(issue["source_fingerprint"])
-                                    added += 1
-                            skipped = len(issues) - added
-                            if added:
-                                st.success(f"Created {added} draft(s)" + (f", skipped {skipped} already seen." if skipped else "."))
-                                st.rerun()
-                            else:
-                                st.info("No new issues found in that range." + (f" ({skipped} already seen.)" if skipped else ""))
-
-        # ---- Pending intake (drafts awaiting approval) ----
-        pending_drafts = draft_store.list("pending")
-        visible_drafts = [
-            draft for draft in pending_drafts
-            if view_all_user
-            or not normalize_department(draft["suggested_department"])
-            or normalize_department(draft["suggested_department"]) == current_user.department
-        ]
-        st.subheader(f"Pending intake ({len(visible_drafts)})")
-        if draft_message := st.session_state.pop("draft_action_message", None):
-            st.info(draft_message)
-        st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
-        if not visible_drafts:
-            st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
-        may_delete_drafts = can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN
-        if may_delete_drafts and visible_drafts:
-            with st.expander("Bulk delete drafts"):
-                labels = {
-                    draft["draft_id"]: f"{draft['summary'] or 'Draft request'} ({draft['draft_id'][:8]})"
-                    for draft in visible_drafts
-                }
-                select_all = st.checkbox(f"Select all {len(labels)} pending drafts", key="delete_all_drafts")
-                selected_drafts = list(labels) if select_all else st.multiselect(
-                    "Drafts to delete", options=list(labels), format_func=labels.__getitem__,
-                    key="bulk_draft_selection",
+        # ---- WhatsApp intake ----
+        if USE_DATABASE:
+            # Reuse the connection pool without caching a store instance across app updates.
+            draft_store = DraftStore(ws.session_factory)
+            with st.expander("Import from WhatsApp"):
+                st.caption(
+                    "Upload an exported WhatsApp chat (.txt or .zip), choose a date range, and scan it. "
+                    "Genuine issues (complaints, app misbehaviour, improvement suggestions) become draft "
+                    "requests you review below. Routine chatter (approvals, dispatch, logbooks) is ignored. "
+                    + ("AI extraction is on." if OPENAI_API_KEY else "No OpenAI key set, so a keyword fallback is used (lower quality).")
                 )
-                if st.button(
-                    f"Delete {len(selected_drafts)} selected drafts", icon=":material/delete:",
-                    key="bulk_delete_drafts", disabled=not selected_drafts,
-                ):
-                    removed = draft_store.delete_pending_many(selected_drafts)
-                    st.session_state.draft_action_message = (
-                        f"Deleted {removed} pending draft(s). "
-                        f"{len(selected_drafts) - removed} no longer pending."
-                        if removed != len(selected_drafts)
-                        else f"Deleted {removed} pending draft(s)."
-                    )
-                    st.rerun()
-        priority_choices = ["Low", "Medium", "High", "Highest"]
-        for draft in visible_drafts:
-            did = draft["draft_id"]
-            header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
-            draft_details = st
-            if may_delete_drafts:
-                draft_details, draft_action = st.columns([11, 1], vertical_alignment="top")
-                if draft_action.button("🗑", help="Delete draft", key=f"delete_draft_{did}"):
-                    removed = draft_store.delete_pending(did)
-                    st.session_state.draft_action_message = (
-                        "Draft deleted." if removed else "This draft is no longer pending."
-                    )
-                    st.rerun()
-            with draft_details.expander(header):
-                summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
-                description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    category = st.selectbox("Category", INTAKE_CATEGORIES, index=option_index(INTAKE_CATEGORIES, draft["category"], len(INTAKE_CATEGORIES) - 1), key=f"dcat_{did}")
-                with col_b:
-                    priority = st.selectbox("Priority", priority_choices, index=option_index(priority_choices, draft["priority"], 1), key=f"dpri_{did}")
-                with col_c:
-                    dept_options = ["— Select department —"] + DEPARTMENTS
-                    suggested_dept = normalize_department(draft["suggested_department"])
-                    dept_index = dept_options.index(suggested_dept) if suggested_dept in dept_options else 0
-                    department_choice = st.selectbox("Assign to department *", dept_options, index=dept_index, key=f"ddept_{did}")
-                    department = "" if department_choice.startswith("—") else department_choice
-                draft_subteams = subteams_for(department)
-                if draft_subteams:
-                    current_sub = clean_subteam(department, draft["suggested_subteam"])
-                    sub_options = ["— Select sub-team —"] + draft_subteams
-                    sub_choice = st.selectbox(
-                        f"{department} sub-team *", sub_options,
-                        index=sub_options.index(current_sub) if current_sub in sub_options else 0, key=f"dsub_{did}",
-                    )
-                    draft_subteam = "" if sub_choice.startswith("—") else sub_choice
-                else:
-                    draft_subteam = ""
-                if draft["requester_name"] or draft["contact"]:
-                    st.caption(f"Requester: {draft['requester_name'] or 'Unknown'}  ·  {draft['contact'] or 'no contact'}")
-                if draft["excerpt"]:
-                    st.caption("Chat excerpt")
-                    st.code(draft["excerpt"])
-                review_note = st.text_input("Note (or reason for rejecting)", key=f"dnote_{did}")
-                may_route = can_manage(department=current_user.department, admin=is_admin_user, ticket_department=department)
-                approve_col, reject_col = st.columns(2)
-                approve = approve_col.button("Approve as support request", type="primary", key=f"dok_{did}", disabled=not may_route)
-                reject = reject_col.button("Reject", key=f"dno_{did}", disabled=not may_route)
-                if not may_route:
-                    st.caption("Only the owning department or an admin can approve or reject this draft.")
-
-                if approve:
-                    if not department:
-                        st.error("Choose a department before approving.")
-                        st.stop()
-                    if not summary.strip():
-                        st.error("Add a summary before approving.")
-                        st.stop()
-                    if draft_subteams and not draft_subteam:
-                        st.error(f"Select a {department} sub-team before approving.")
-                        st.stop()
-                    ticket_id = str(uuid.uuid4())
-                    now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-                    support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
-                    reported_ts = pd.to_datetime(draft["reported_at"], errors="coerce", utc=True) if draft["reported_at"] else pd.NaT
-                    reported_value = draft["reported_at"] if (pd.notna(reported_ts) and reported_ts <= pd.Timestamp.now(tz="UTC")) else now_stamp
-                    new = {
-                        "Ticket ID": ticket_id, "Support Request Number": support_number,
-                        "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
-                        "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
-                        "Reported At": reported_value, "Requester Type": "External Clients",
-                        "Requester Name": draft["requester_name"] or "", "Channel": "WhatsApp",
-                        "Customer WhatsApp": draft["contact"] or "",
-                        "Assigned Department": department, "Assigned Sub-team": draft_subteam,
-                        "Reporting Department": current_user.department, "Callback Required": "No",
-                    }
-                    approved = draft_store.resolve(
-                        did, status="approved", reviewed_by=current_user.username,
-                        review_note=review_note.strip(), approved_ticket_id=ticket_id, ticket=new,
-                    )
-                    st.session_state.draft_action_message = (
-                        f"Approved as {support_number}." if approved else "This draft is no longer pending."
-                    )
-                    st.rerun()
-                if reject:
-                    rejected = draft_store.resolve(
-                        did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip(),
-                    )
-                    st.session_state.draft_action_message = (
-                        "Draft rejected." if rejected else "This draft is no longer pending."
-                    )
-                    st.rerun()
-
-with tab_admin:
-    # ---- Historical IT workbook import ----
-    if USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN:
-        with st.expander("Upload closed IT requests (.xlsx)"):
-            st.caption(
-                "Upload an IT Requests workbook, check the preview, and import directly into IT. "
-                "An external key can only be imported once. Dates without a timezone are Nairobi time."
-            )
-            if result := st.session_state.pop("it_workbook_result", None):
-                st.success(f"Created {result[0]} closed IT requests. Skipped {result[1]} existing keys.")
-            workbook = st.file_uploader("IT requests workbook", type=["xlsx"], key="it_workbook_import")
-            if workbook is not None:
-                try:
-                    tickets = read_it_workbook(workbook.getvalue())
-                except ValueError as error:
-                    st.error(str(error))
-                else:
-                    st.dataframe([
-                        {
-                            "External Key": ticket["external_key"], "Summary": ticket["summary"],
-                            "Assignee": ticket["assignee"], "Reported At": ticket["reported_at"],
-                            "Resolved At": ticket["resolved_at"], "Closed At": ticket["closed_at"],
-                            "Resolution Summary": ticket["resolution_summary"],
-                        }
-                        for ticket in tickets
-                    ], width="stretch", hide_index=True)
-                    if st.button(f"Import {len(tickets)} closed IT requests", type="primary"):
-                        try:
-                            count = import_it_tickets(ws.session_factory, tickets, actor=current_user.username)
-                        except SQLAlchemyError:
-                            st.error("The database could not import this workbook. No partial batch was saved.")
+                wa_upload = st.file_uploader("WhatsApp chat export", type=["txt", "zip"], key="whatsapp_import")
+                if wa_upload is not None:
+                    messages = parse_whatsapp_cached(wa_upload.getvalue(), wa_upload.name)
+                    convo = [m for m in messages if not m["system"] and m["sender"]]
+                    stamps = [s for s in (parse_timestamp(m["timestamp"]) for m in convo if m["timestamp"]) if pd.notna(s)]
+                    if not stamps:
+                        st.warning("No dated messages were found. Export the chat without media and try again.")
+                    else:
+                        min_date, max_date = min(stamps).date(), max(stamps).date()
+                        st.caption(f"Chat spans {min_date:%d %b %Y} to {max_date:%d %b %Y} ({len(convo)} messages).")
+                        default_start = max(min_date, max_date - timedelta(days=7))
+                        range_left, range_right = st.columns(2)
+                        start_date = range_left.date_input("From", value=default_start, min_value=min_date, max_value=max_date, key="wa_from")
+                        end_date = range_right.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key="wa_to")
+                        if start_date > end_date:
+                            st.error("The 'From' date must be on or before the 'To' date.")
                         else:
-                            st.session_state.it_workbook_result = (count, len(tickets) - count)
-                            st.rerun()
+                            windowed = [
+                                m for m in convo
+                                if (ts := parse_timestamp(m["timestamp"])) is not None and pd.notna(ts)
+                                and start_date <= ts.date() <= end_date
+                            ]
+                            st.caption(f"{len(windowed)} messages in the selected range.")
+                            if len(windowed) > 3000:
+                                st.warning("That is a large range. Narrow the dates to keep the scan fast and within API limits.")
+                            if st.button("Scan range for issues", key="scan_whatsapp", disabled=not windowed):
+                                with st.spinner("Reading messages and drafting issues…"):
+                                    issues = extract_issues(
+                                        windowed, categories=INTAKE_CATEGORIES,
+                                        api_key=OPENAI_API_KEY or None, model=OPENAI_MODEL,
+                                    )
+                                    known = draft_store.fingerprints()
+                                    added = 0
+                                    for issue in issues:
+                                        if issue["source_fingerprint"] in known:
+                                            continue
+                                        draft_store.add({
+                                            **issue, "source": "whatsapp",
+                                            "source_reference": f"{wa_upload.name} [{start_date}..{end_date}]",
+                                        })
+                                        known.add(issue["source_fingerprint"])
+                                        added += 1
+                                skipped = len(issues) - added
+                                if added:
+                                    st.success(f"Created {added} draft(s)" + (f", skipped {skipped} already seen." if skipped else "."))
+                                    st.rerun()
+                                else:
+                                    st.info("No new issues found in that range." + (f" ({skipped} already seen.)" if skipped else ""))
 
-    # ---- Jira import ----
-    with st.expander("Import and normalize Jira data"):
-        st.caption("Upload a Jira CSV to preview its normalized production schema. Existing stable Ticket IDs are skipped.")
-        jira_upload = st.file_uploader("Jira CSV export", type=["csv"], key="jira_import")
-        if jira_upload is not None:
-            normalized_jira = normalize_jira_csv(jira_upload.getvalue())
-            jira_stats = import_summary(normalized_jira)
-            j1, j2, j3, j4 = st.columns(4)
-            j1.metric("Rows", jira_stats["rows"])
-            j2.metric("Jira keys", jira_stats["with_external_key"])
-            j3.metric("Assigned", jira_stats["with_assignee"])
-            j4.metric("Invalid dates", jira_stats["invalid_created"])
-            st.dataframe(normalized_jira.head(25), width="stretch", hide_index=True)
-            st.download_button(
-                "Download normalized preview",
-                normalized_jira.to_csv(index=False).encode("utf-8"),
-                "jira-normalized.csv",
-                "text/csv",
-            )
-            if st.button("Import new Jira tickets", type="primary"):
-                existing = read_df(ws, REQUIRED_HEADERS)
-                existing_ids = set(existing["Ticket ID"].astype(str))
-                new_rows = normalized_jira[~normalized_jira["Ticket ID"].isin(existing_ids)]
-                if new_rows.empty:
-                    st.info("No new tickets were found.")
-                else:
-                    ws.append_rows(new_rows[REQUIRED_HEADERS].fillna("").values.tolist())
-                    now_stamp = datetime.now().isoformat(timespec="seconds")
-                    actor = st.session_state.get("user", "dashboard-user")
-                    activity_rows = [
-                        [str(uuid.uuid4()), row["Ticket ID"], "jira_imported", "External Key", "", row["External Key"], "", now_stamp, actor]
-                        for _, row in new_rows.iterrows()
-                    ]
-                    activity_ws.append_rows(activity_rows)
-                    st.success(f"Imported {len(new_rows)} new Jira ticket(s).")
-                    st.rerun()
+            # ---- Pending intake (drafts awaiting approval) ----
+            pending_drafts = draft_store.list("pending")
+            visible_drafts = [
+                draft for draft in pending_drafts
+                if view_all_user
+                or not normalize_department(draft["suggested_department"])
+                or normalize_department(draft["suggested_department"]) == current_user.department
+            ]
+            st.subheader(f"Pending intake ({len(visible_drafts)})")
+            if draft_message := st.session_state.pop("draft_action_message", None):
+                st.info(draft_message)
+            st.caption("Draft requests from WhatsApp. Set the department, then approve to create a support request, or reject. Drafts do not count toward SLA until approved.")
+            if not visible_drafts:
+                st.caption("Nothing awaiting review." if not pending_drafts else "No drafts routed to your department.")
+            may_delete_drafts = can_delete(admin=is_admin_user) and current_user is not OPEN_ADMIN
+            if may_delete_drafts and visible_drafts:
+                with st.expander("Bulk delete drafts"):
+                    labels = {
+                        draft["draft_id"]: f"{draft['summary'] or 'Draft request'} ({draft['draft_id'][:8]})"
+                        for draft in visible_drafts
+                    }
+                    select_all = st.checkbox(f"Select all {len(labels)} pending drafts", key="delete_all_drafts")
+                    selected_drafts = list(labels) if select_all else st.multiselect(
+                        "Drafts to delete", options=list(labels), format_func=labels.__getitem__,
+                        key="bulk_draft_selection",
+                    )
+                    if st.button(
+                        f"Delete {len(selected_drafts)} selected drafts", icon=":material/delete:",
+                        key="bulk_delete_drafts", disabled=not selected_drafts,
+                    ):
+                        removed = draft_store.delete_pending_many(selected_drafts)
+                        st.session_state.draft_action_message = (
+                            f"Deleted {removed} pending draft(s). "
+                            f"{len(selected_drafts) - removed} no longer pending."
+                            if removed != len(selected_drafts)
+                            else f"Deleted {removed} pending draft(s)."
+                        )
+                        st.rerun()
+            priority_choices = ["Low", "Medium", "High", "Highest"]
+            for draft in visible_drafts:
+                did = draft["draft_id"]
+                header = f"{draft['summary'] or 'Draft request'}  ·  {draft['category'] or 'Uncategorised'}  ·  {draft['suggested_department'] or 'Unrouted'}"
+                draft_details = st
+                if may_delete_drafts:
+                    draft_details, draft_action = st.columns([11, 1], vertical_alignment="top")
+                    if draft_action.button("🗑", help="Delete draft", key=f"delete_draft_{did}"):
+                        removed = draft_store.delete_pending(did)
+                        st.session_state.draft_action_message = (
+                            "Draft deleted." if removed else "This draft is no longer pending."
+                        )
+                        st.rerun()
+                with draft_details.expander(header):
+                    summary = st.text_input("Summary", value=draft["summary"] or "", key=f"ds_{did}")
+                    description = st.text_area("Details", value=draft["description"] or "", key=f"dd_{did}")
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        category = st.selectbox("Category", INTAKE_CATEGORIES, index=option_index(INTAKE_CATEGORIES, draft["category"], len(INTAKE_CATEGORIES) - 1), key=f"dcat_{did}")
+                    with col_b:
+                        priority = st.selectbox("Priority", priority_choices, index=option_index(priority_choices, draft["priority"], 1), key=f"dpri_{did}")
+                    with col_c:
+                        dept_options = ["— Select department —"] + DEPARTMENTS
+                        suggested_dept = normalize_department(draft["suggested_department"])
+                        dept_index = dept_options.index(suggested_dept) if suggested_dept in dept_options else 0
+                        department_choice = st.selectbox("Assign to department *", dept_options, index=dept_index, key=f"ddept_{did}")
+                        department = "" if department_choice.startswith("—") else department_choice
+                    draft_subteams = subteams_for(department)
+                    if draft_subteams:
+                        current_sub = clean_subteam(department, draft["suggested_subteam"])
+                        sub_options = ["— Select sub-team —"] + draft_subteams
+                        sub_choice = st.selectbox(
+                            f"{department} sub-team *", sub_options,
+                            index=sub_options.index(current_sub) if current_sub in sub_options else 0, key=f"dsub_{did}",
+                        )
+                        draft_subteam = "" if sub_choice.startswith("—") else sub_choice
+                    else:
+                        draft_subteam = ""
+                    if draft["requester_name"] or draft["contact"]:
+                        st.caption(f"Requester: {draft['requester_name'] or 'Unknown'}  ·  {draft['contact'] or 'no contact'}")
+                    if draft["excerpt"]:
+                        st.caption("Chat excerpt")
+                        st.code(draft["excerpt"])
+                    review_note = st.text_input("Note (or reason for rejecting)", key=f"dnote_{did}")
+                    may_route = can_manage(department=current_user.department, admin=is_admin_user, ticket_department=department)
+                    approve_col, reject_col = st.columns(2)
+                    approve = approve_col.button("Approve as support request", type="primary", key=f"dok_{did}", disabled=not may_route)
+                    reject = reject_col.button("Reject", key=f"dno_{did}", disabled=not may_route)
+                    if not may_route:
+                        st.caption("Only the owning department or an admin can approve or reject this draft.")
 
-    if not (USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN):
-        st.caption("Additional admin tools appear here for administrators.")
+                    if approve:
+                        if not department:
+                            st.error("Choose a department before approving.")
+                            st.stop()
+                        if not summary.strip():
+                            st.error("Add a summary before approving.")
+                            st.stop()
+                        if draft_subteams and not draft_subteam:
+                            st.error(f"Select a {department} sub-team before approving.")
+                            st.stop()
+                        ticket_id = str(uuid.uuid4())
+                        now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                        support_number = f"SUP-{datetime.now():%Y%m%d}-{ticket_id[:6].upper()}"
+                        reported_ts = pd.to_datetime(draft["reported_at"], errors="coerce", utc=True) if draft["reported_at"] else pd.NaT
+                        reported_value = draft["reported_at"] if (pd.notna(reported_ts) and reported_ts <= pd.Timestamp.now(tz="UTC")) else now_stamp
+                        new = {
+                            "Ticket ID": ticket_id, "Support Request Number": support_number,
+                            "Summary": summary.strip(), "Description": description.strip(), "Status": "to do",
+                            "Priority": priority, "Category": category, "Created": now_stamp, "Updated At": now_stamp,
+                            "Reported At": reported_value, "Requester Type": "External Clients",
+                            "Requester Name": draft["requester_name"] or "", "Channel": "WhatsApp",
+                            "Customer WhatsApp": draft["contact"] or "",
+                            "Assigned Department": department, "Assigned Sub-team": draft_subteam,
+                            "Reporting Department": current_user.department, "Callback Required": "No",
+                        }
+                        approved = draft_store.resolve(
+                            did, status="approved", reviewed_by=current_user.username,
+                            review_note=review_note.strip(), approved_ticket_id=ticket_id, ticket=new,
+                        )
+                        st.session_state.draft_action_message = (
+                            f"Approved as {support_number}." if approved else "This draft is no longer pending."
+                        )
+                        st.rerun()
+                    if reject:
+                        rejected = draft_store.resolve(
+                            did, status="rejected", reviewed_by=current_user.username, review_note=review_note.strip(),
+                        )
+                        st.session_state.draft_action_message = (
+                            "Draft rejected." if rejected else "This draft is no longer pending."
+                        )
+                        st.rerun()
+
+if tab_admin.open:
+    with tab_admin:
+        # ---- Historical IT workbook import ----
+        if USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN:
+            with st.expander("Upload closed IT requests (.xlsx)"):
+                st.caption(
+                    "Upload an IT Requests workbook, check the preview, and import directly into IT. "
+                    "An external key can only be imported once. Dates without a timezone are Nairobi time."
+                )
+                if result := st.session_state.pop("it_workbook_result", None):
+                    st.success(f"Created {result[0]} closed IT requests. Skipped {result[1]} existing keys.")
+                workbook = st.file_uploader("IT requests workbook", type=["xlsx"], key="it_workbook_import")
+                if workbook is not None:
+                    try:
+                        tickets = read_it_workbook(workbook.getvalue())
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.dataframe([
+                            {
+                                "External Key": ticket["external_key"], "Summary": ticket["summary"],
+                                "Assignee": ticket["assignee"], "Reported At": ticket["reported_at"],
+                                "Resolved At": ticket["resolved_at"], "Closed At": ticket["closed_at"],
+                                "Resolution Summary": ticket["resolution_summary"],
+                            }
+                            for ticket in tickets
+                        ], width="stretch", hide_index=True)
+                        if st.button(f"Import {len(tickets)} closed IT requests", type="primary"):
+                            try:
+                                count = import_it_tickets(ws.session_factory, tickets, actor=current_user.username)
+                            except SQLAlchemyError:
+                                st.error("The database could not import this workbook. No partial batch was saved.")
+                            else:
+                                st.session_state.it_workbook_result = (count, len(tickets) - count)
+                                st.rerun()
+
+        # ---- Jira import ----
+        with st.expander("Import and normalize Jira data"):
+            st.caption("Upload a Jira CSV to preview its normalized production schema. Existing stable Ticket IDs are skipped.")
+            jira_upload = st.file_uploader("Jira CSV export", type=["csv"], key="jira_import")
+            if jira_upload is not None:
+                normalized_jira = normalize_jira_csv(jira_upload.getvalue())
+                jira_stats = import_summary(normalized_jira)
+                j1, j2, j3, j4 = st.columns(4)
+                j1.metric("Rows", jira_stats["rows"])
+                j2.metric("Jira keys", jira_stats["with_external_key"])
+                j3.metric("Assigned", jira_stats["with_assignee"])
+                j4.metric("Invalid dates", jira_stats["invalid_created"])
+                st.dataframe(normalized_jira.head(25), width="stretch", hide_index=True)
+                st.download_button(
+                    "Download normalized preview",
+                    normalized_jira.to_csv(index=False).encode("utf-8"),
+                    "jira-normalized.csv",
+                    "text/csv",
+                )
+                if st.button("Import new Jira tickets", type="primary"):
+                    existing = read_df(ws, REQUIRED_HEADERS)
+                    existing_ids = set(existing["Ticket ID"].astype(str))
+                    new_rows = normalized_jira[~normalized_jira["Ticket ID"].isin(existing_ids)]
+                    if new_rows.empty:
+                        st.info("No new tickets were found.")
+                    else:
+                        ws.append_rows(new_rows[REQUIRED_HEADERS].fillna("").values.tolist())
+                        now_stamp = datetime.now().isoformat(timespec="seconds")
+                        actor = st.session_state.get("user", "dashboard-user")
+                        activity_rows = [
+                            [str(uuid.uuid4()), row["Ticket ID"], "jira_imported", "External Key", "", row["External Key"], "", now_stamp, actor]
+                            for _, row in new_rows.iterrows()
+                        ]
+                        activity_ws.append_rows(activity_rows)
+                        st.success(f"Imported {len(new_rows)} new Jira ticket(s).")
+                        st.rerun()
+
+        if not (USE_DATABASE and is_admin_user and current_user is not OPEN_ADMIN):
+            st.caption("Additional admin tools appear here for administrators.")

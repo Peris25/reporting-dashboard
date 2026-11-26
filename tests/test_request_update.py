@@ -32,7 +32,9 @@ def test_save_request_update_preserves_id_and_records_activity(tmp_path, monkeyp
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
         app.run(timeout=30)
         assert not app.exception
+        app.button(key="ticket_card_tickets").click().run(timeout=30)
         assert not any(button.label == "Save request update" for button in app.button)
+        app.session_state["ticket_edit_version"] = 1
         app.session_state["editing_ticket_id"] = "request-1"
         app.run(timeout=30)
         assert not app.exception
@@ -77,6 +79,11 @@ def test_save_request_update_preserves_id_and_records_activity(tmp_path, monkeyp
         assert len(status_events) == 1
         assert status_events[0]["Old Value"] == "to do"
         assert status_events[0]["New Value"] == "closed"
+        assert not any("To do" in element.value for element in app.text)
+        revision = closed["Updated At"]
+        version = app.session_state["ticket_edit_version"]
+        app.session_state[f"edit_ticket_request-1_{revision}_{version}_history"] = True
+        app.run(timeout=30)
         assert any("To do → Closed" in element.value for element in app.text)
 
         # Backfill actual milestones in Nairobi time, without changing closure time.

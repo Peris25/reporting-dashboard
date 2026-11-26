@@ -22,11 +22,11 @@ def test_quick_milestones_save_owner_and_activity_without_overwriting_response(t
     try:
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=30)
         assert not app.exception
+        app.button(key="ticket_card_tickets").click().run(timeout=30)
         assert not any(button.label == "Save request update" for button in app.button)
         app.session_state["editing_ticket_id"] = "quick-1"
         app.run(timeout=30)
         assert not app.exception
-        assert any("Analytics refresh every 10 minutes" in caption.value for caption in app.caption)
         owners = [field for field in app.text_input if field.label == "Assigned support agent"]
         owners[-1].set_value("Peris")
         next(button for button in app.button if button.label == "Mark responded").click()
@@ -48,7 +48,6 @@ def test_quick_milestones_save_owner_and_activity_without_overwriting_response(t
         events = activities.get_all_records()
         assert len([event for event in events if event["Field"] == "First Response At"]) == 1
         assert any(event["Action"] == "status_changed" and event["New Value"] == "diagnosed" for event in events)
-        assert any("Last 7 days" in table.columns for table in tables)
     finally:
         st.cache_resource.clear()
 
