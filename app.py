@@ -885,6 +885,7 @@ def add_ticket_dialog():
         left, right = st.columns(2)
         reported = left.datetime_input("Reported at", value=None)
         resolved = right.datetime_input("Resolved at (optional)", value=None)
+        resolution_summary = st.text_area("Resolution summary", placeholder="Briefly describe what you did to fix the issue.").strip()
         submitted = st.form_submit_button("Save", type="primary", width="stretch")
 
     if not submitted:
@@ -901,6 +902,8 @@ def add_ticket_dialog():
         errors.append(f"Select a {assign_department} sub-team.")
     if any(value and pd.Timestamp(value) > now for value in (reported_stamp, resolved_stamp)):
         errors.append("Reported and resolved times cannot be in the future.")
+    if resolved and not resolution_summary:
+        errors.append("Enter a resolution summary when saving a resolved ticket.")
     if reported and resolved and resolved < reported:
         errors.append("Resolved at must be at or after Reported at.")
     if errors:
@@ -918,6 +921,7 @@ def add_ticket_dialog():
         "Updated At": now.isoformat(),
         "Reported At": reported_stamp,
         "Resolved At": resolved_stamp,
+        "Resolution Summary": resolution_summary,
         "Closed At": resolved_stamp,
         "Requester Type": requester,
         "Requester Name": company,
