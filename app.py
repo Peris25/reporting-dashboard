@@ -14,7 +14,7 @@ from reporting.jira import import_summary, normalize_jira_csv
 from reporting.schema import ACTIVITY_HEADERS, STATUSES, TICKET_HEADERS
 from reporting.sla import enrich_tickets, format_duration, overdue_milestones, reported_time
 from reporting.views import render_department_breakdown, render_reporting_views, render_weekly_report
-from reporting.analytics import ALL_REQUESTERS_OPTION, filter_requests, milestone_deadlines
+from reporting.analytics import ALL_REQUESTERS_OPTION, filter_requests
 from reporting.workflow import can_transition
 from reporting.history import request_history
 from reporting.database import DraftStore, create_user_store, create_weekly_task_store, database_handles
@@ -246,26 +246,6 @@ def nairobi_timestamp(value):
     return pd.Timestamp(value).tz_localize("Africa/Nairobi").isoformat() if value else ""
 
 
-@st.fragment(run_every="10m")
-def render_request_deadlines(worksheet, ticket_id):
-    st.button("Refresh request deadlines", key="refresh_deadlines")
-    latest = read_df(worksheet, REQUIRED_HEADERS)
-    matching = latest.loc[latest["Ticket ID"].eq(ticket_id)]
-    if matching.empty:
-        st.warning("This request is no longer available. Refresh to select another request.")
-        return
-    ticket = matching.iloc[0]
-    st.info(f"Current status: {normalize_text(ticket['Status']).capitalize()} | Assigned to: {normalize_text(ticket['Assignee']) or 'Unassigned'}")
-    reported = nairobi_input_value(reported_time(ticket))
-    logged = nairobi_input_value(ticket["Created"])
-    st.caption(f"Reported: {reported:%d %b %Y, %H:%M}" if reported else "Reporting time unavailable")
-    st.caption(f"Entered in dashboard: {logged:%d %b %Y, %H:%M} (Nairobi time)" if logged else "Entry time unavailable")
-    for column, entry in zip(st.columns(3), milestone_deadlines(ticket)):
-        with column:
-            getattr(st, entry["tone"])(entry["text"])
-    st.caption("Deadlines refresh every 10 minutes. All clocks start at the actual reporting time.")
-
-
 def contact_message(view):
     breached_response = int((view["Response SLA"] == "Breached").sum())
     breached_diagnosis = int((view["Diagnosis SLA"] == "Breached").sum())
@@ -477,7 +457,6 @@ render_dashboard_hero()
 render_sidebar_header(f"{current_user.department} Support")
 
 df = read_df(ws, REQUIRED_HEADERS)
-activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
 
 # ---- Normalize main data ----
 df["Status"] = df["Status"].astype(str).str.strip().str.lower()
@@ -938,8 +917,326 @@ def add_ticket_dialog():
     st.rerun()
 
 
+def render_ticket_deletion(ticket_view):
+    colA, colB = st.columns([1, 1])
+    with colA:
+        delete_ids = st.multiselect(
+            "Delete tickets (select by Summary)",
+            options=ticket_view["Ticket ID"].tolist(),
+            format_func=lambda tid: ticket_view.loc[ticket_view["Ticket ID"] == tid, "Summary"].values[0],
+        )
+    with colB:
+        delete_note = st.text_input("Delete note (optional)", placeholder="Why is this ticket being deleted?")
+
+    if st.button("Delete selected"):
+        if not delete_ids:
+            st.warning("Select at least one ticket to delete.")
+            st.stop()
+        base = read_df(ws, REQUIRED_HEADERS)
+        base = pd.DataFrame(base)
+        doomed = base[base["Ticket ID"].isin(delete_ids)].copy()
+        for _, row in doomed.iterrows():
+            append_activity(
+                activity_ws,
+                ticket_id=row["Ticket ID"],
+                action="ticket_deleted",
+                field="Status",
+                old_value=row.get("Status", ""),
+                new_value="",
+                note=delete_note.strip(),
+            )
+        delete_tickets(ws, delete_ids)
+        st.success(f"Deleted {len(delete_ids)} ticket(s).")
+        st.rerun()
+
+
+
+def close_ticket_editor():
+    st.session_state.pop("editing_ticket_id", None)
+    st.session_state.pop("editing_ticket_revision", None)
+    st.session_state["ticket_edit_version"] = st.session_state.get("ticket_edit_version", 0) + 1
+
+
+@st.dialog("Ticket details", width="medium", on_dismiss=close_ticket_editor)
+def edit_ticket_dialog(selected, ticket_label):
+    selected_ticket_id = selected["Ticket ID"]
+    form_key = f"edit_ticket_{selected_ticket_id}_{selected['Updated At']}_{st.session_state.get('ticket_edit_version', 0)}"
+    st.caption(ticket_label)
+    can_manage_selected = can_manage(
+        department=current_user.department, admin=is_admin_user, ticket_department=selected["Assigned Department"]
+    )
+    if not can_manage_selected:
+        st.info("This request is owned by another department. You have view-only access and can add a note below.")
+
+    with st.expander("Department routing"):
+        current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+        new_department = st.selectbox(
+            "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
+            key=f"{form_key}_department", disabled=not can_manage_selected,
+            help="Reassign this request to another department. Choosing a department with sub-teams requires selecting one below.",
+        )
+
+    with st.form(form_key, enter_to_submit=False):
+        issue = st.text_input("Issue summary", value=normalize_text(selected["Summary"]))
+        references = st.columns(2)
+        reg_no = references[0].text_input("Reg No", value=normalize_text(selected["Reg No"]))
+        job_id = references[1].text_input("Job Request ID", value=normalize_text(selected["Job Request ID"]))
+        channel = st.text_input("Channel", value=normalize_text(selected["Channel"]))
+        corrected_reported_at = st.datetime_input(
+            "Reported at (Nairobi time)", value=nairobi_input_value(reported_time(selected)),
+            help="Correct the actual reporting time. This recalculates SLA deadlines and leaves the dashboard entry timestamp unchanged.",
+        )
+        status_value = normalize_text(selected["Status"]).lower()
+        new_status = st.selectbox(
+            "Status",
+            options=STATUSES,
+            index=STATUSES.index(status_value) if status_value in STATUSES else 0,
+            help="Resolved requests can move directly to Closed. Add a resolution summary before saving.",
+        )
+        resolved_at = st.datetime_input(
+            "Resolved at (Nairobi time)", value=nairobi_input_value(selected["Closed At"] or selected["Resolved At"]),
+        )
+        resolution_summary = st.text_area(
+            "Resolution summary",
+            value=normalize_text(selected["Resolution Summary"]),
+            placeholder="What was done to resolve or progress this request?",
+        )
+        with st.expander("Assignment, callback and SLA details"):
+            update_left, update_right = st.columns(2)
+            with update_left:
+                priority_value = normalize_text(selected["Priority"])
+                priority_options = ["Low", "Medium", "High", "Urgent"]
+                if priority_value not in priority_options:
+                    priority_options.insert(0, priority_value)
+                new_priority = st.selectbox(
+                    "Priority",
+                    options=priority_options,
+                    index=priority_options.index(priority_value),
+                    format_func=lambda value: value or "Not set",
+                )
+                new_assignee = st.text_input("Assigned support agent", value=normalize_text(selected["Assignee"]))
+            with update_right:
+                callback_value = normalize_text(selected["Callback Required"])
+                new_callback_required = st.checkbox("Callback required", value=callback_value == "Yes")
+                new_callback_deadline = st.text_input(
+                    "Callback deadline",
+                    value=normalize_text(selected["Callback Deadline"]),
+                    placeholder="YYYY-MM-DD HH:MM",
+                    disabled=not new_callback_required,
+                )
+                callback_done = st.checkbox(
+                    "Callback completed",
+                    value=bool(normalize_text(selected["Callback Completed At"])),
+                )
+
+            route_subteams = subteams_for(new_department)
+            if route_subteams:
+                current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
+                route_options = ["— Select sub-team —"] + route_subteams
+                route_choice = st.selectbox(
+                    f"{new_department} sub-team *", route_options,
+                    index=route_options.index(current_subteam) if current_subteam in route_options else 0,
+                    help="Required for this department. Pick the exact team that owns this request.",
+                )
+                new_subteam = "" if route_choice.startswith("—") else route_choice
+            else:
+                new_subteam = ""
+
+            st.caption("Record when you first responded and understood the problem. Use Nairobi time; leave unknown times blank.")
+            response_column, diagnosis_column = st.columns(2)
+            with response_column:
+                first_response_at = st.datetime_input(
+                    "First response sent at", value=nairobi_input_value(selected["First Response At"]),
+                )
+                mark_responded = st.form_submit_button(
+                    "Mark responded",
+                    disabled=bool(normalize_text(selected["First Response At"])) or selected["Status"] == "closed" or not can_manage_selected,
+                    help="Record the first response as now and save the current form edits. Use only after responding to the requester.",
+                )
+            with diagnosis_column:
+                diagnosed_at = st.datetime_input(
+                    "Problem diagnosed at", value=nairobi_input_value(selected["Diagnosed At"]),
+                )
+                mark_diagnosed = st.form_submit_button(
+                    "Mark diagnosed",
+                    disabled=bool(normalize_text(selected["Diagnosed At"])) or selected["Status"] == "closed" or not can_manage_selected,
+                    help="Record diagnosis as now and save the current form edits. A To do request moves to Diagnosed.",
+                )
+            st.caption("Milestone buttons record the time now and save your form edits. Use the date fields to correct earlier times.")
+            update_note = st.text_area("Update note", placeholder="Add context for this change")
+        save_edits = st.form_submit_button("Save request update", type="primary", disabled=not can_manage_selected)
+
+    if save_edits or mark_responded or mark_diagnosed:
+        if not can_manage_selected:
+            st.error("You do not have permission to edit this request.")
+            return
+        if subteams_for(new_department) and not clean_subteam(new_department, new_subteam):
+            st.error(f"Select a {new_department} sub-team before saving.")
+            return
+        base = read_df(ws, REQUIRED_HEADERS)
+        base = pd.DataFrame(base)
+        for col in REQUIRED_HEADERS:
+            if col not in base.columns:
+                base[col] = ""
+
+        if base["Ticket ID"].astype(str).duplicated().any():
+            st.error("Duplicate Ticket IDs were found. Resolve them before editing.")
+            return
+
+        base_idx = base.set_index("Ticket ID", drop=False)
+        tid = selected_ticket_id
+        if tid not in base_idx.index:
+            st.error("This request no longer exists. Refresh to select another request.")
+            return
+        current = {col: normalize_text(base_idx.loc[tid, col]) for col in REQUIRED_HEADERS}
+        if current["Updated At"] != st.session_state.get("editing_ticket_revision", normalize_text(selected["Updated At"])):
+            st.error("This ticket changed while you were editing. Close it and reopen it before saving.")
+            return
+        if not issue.strip():
+            st.error("Enter an issue summary.")
+            return
+        # Treat a legacy blank department as its normalized default so simply
+        # opening and saving a request does not log a phantom routing change.
+        current["Assigned Department"] = normalize_department(current["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
+        proposed = current.copy()
+        for field, value in {
+            "Summary": issue.strip(), "Reg No": reg_no.strip(), "Job Request ID": job_id.strip(),
+            "Channel": channel.strip(),
+        }.items():
+            if value != normalize_text(selected[field]):
+                proposed[field] = value.upper() if field == "Reg No" else value
+        resolution_changed = resolved_at != nairobi_input_value(selected["Closed At"] or selected["Resolved At"])
+        if resolution_changed:
+            proposed["Resolved At"] = nairobi_timestamp(resolved_at)
+            if new_status == "closed":
+                proposed["Closed At"] = proposed["Resolved At"]
+        if corrected_reported_at != nairobi_input_value(reported_time(selected)):
+            if corrected_reported_at is None:
+                st.error("Set the date and time the request was reported.")
+                return
+            proposed["Reported At"] = nairobi_timestamp(corrected_reported_at)
+        for field, entered in [("First Response At", first_response_at), ("Diagnosed At", diagnosed_at)]:
+            # Preserve the stored timestamp unless the user actually changes it.
+            if entered != nairobi_input_value(selected[field]):
+                proposed[field] = nairobi_timestamp(entered)
+        proposed.update({
+            "Status": new_status,
+            "Priority": new_priority,
+            "Assignee": new_assignee.strip(),
+            "Callback Required": current["Callback Required"] if new_callback_required == (callback_value == "Yes") else ("Yes" if new_callback_required else "No"),
+            "Callback Deadline": "" if not new_callback_required and callback_value == "Yes" else new_callback_deadline.strip(),
+            "Callback Completed At": (
+                current["Callback Completed At"] or datetime.now().astimezone().isoformat(timespec="seconds")
+            ) if callback_done else "",
+            "Resolution Summary": resolution_summary.strip(),
+            "Assigned Department": new_department,
+            "Assigned Sub-team": clean_subteam(new_department, new_subteam),
+        })
+        current["Status"] = current["Status"].lower()
+        now_stamp = datetime.now().astimezone().isoformat()
+        reporting_changed = proposed["Reported At"] != current["Reported At"]
+        reported_stamp = pd.to_datetime(reported_time(proposed), errors="coerce", utc=True)
+        if reporting_changed and (pd.isna(reported_stamp) or reported_stamp > pd.Timestamp.now(tz="UTC") or reported_stamp > pd.to_datetime(current["Created"], utc=True)):
+            st.error("Reporting time must not be later than the dashboard entry time or now.")
+            return
+
+        if mark_responded or mark_diagnosed:
+            if current["Status"] == "closed":
+                st.error("This request is already closed. Use the date fields to correct its recorded times.")
+                return
+            field = "First Response At" if mark_responded else "Diagnosed At"
+            proposed[field] = current[field] or now_stamp
+            if mark_diagnosed and current["Status"] == "to do" and proposed["Status"] == "to do":
+                proposed["Status"] = "diagnosed"
+
+        for field in ["First Response At", "Diagnosed At", "Resolved At", "Closed At"]:
+            if (proposed[field] != current[field] or reporting_changed or resolution_changed) and proposed[field]:
+                timestamp = pd.to_datetime(proposed[field], utc=True)
+                received = reported_stamp
+                closed = pd.to_datetime(proposed["Closed At"], errors="coerce", utc=True)
+                if pd.isna(received) or timestamp < received or timestamp > pd.Timestamp.now(tz="UTC"):
+                    st.error(f"{field} must be between when the request was reported and now.")
+                    return
+                if proposed["Status"] == "closed" and pd.notna(closed) and timestamp > closed:
+                    st.error(f"{field} cannot be after request closure.")
+                    return
+
+        if new_callback_required and new_callback_deadline and not valid_datetime(new_callback_deadline):
+            st.error("Callback deadline must use a valid date and time.")
+            return
+        if current["Status"] != proposed["Status"]:
+            if proposed["Status"] == "closed" and not proposed["Resolution Summary"]:
+                st.error("Add a resolution summary before closing this request.")
+                return
+            if not can_transition(current["Status"], proposed["Status"]):
+                st.error(
+                    f"This request cannot move directly from {current['Status']} "
+                    f"to {proposed['Status']}. Follow the defined workflow."
+                )
+                return
+            if proposed["Status"] in ["diagnosed", "in progress", "qa testing", "deployed"] and not proposed["Diagnosed At"]:
+                proposed["Diagnosed At"] = now_stamp
+            if proposed["Status"] in ["deployed", "closed"] and not proposed["Resolved At"]:
+                proposed["Resolved At"] = now_stamp
+            if proposed["Status"] == "closed":
+                proposed["Closed At"] = nairobi_timestamp(resolved_at) or now_stamp
+            if current["Status"] == "closed" and proposed["Status"] != "closed":
+                proposed["Closed At"] = ""
+
+        changed_fields = [
+            field for field in REQUIRED_HEADERS
+            if field not in ["Ticket ID", "Updated At"] and current[field] != proposed[field]
+        ]
+        if not changed_fields:
+            st.info("No changes to save.")
+            return
+
+        proposed["Updated At"] = now_stamp
+        update_ticket(ws, tid, proposed)
+        for field in changed_fields:
+            append_activity(
+                activity_ws,
+                ticket_id=tid,
+                action="status_changed" if field == "Status" else "field_edited",
+                field=field,
+                old_value=current[field],
+                new_value=proposed[field],
+                note=update_note.strip(),
+            )
+
+        st.session_state["editing_ticket_revision"] = now_stamp
+        st.toast("Support request updated.")
+        st.rerun()
+
+    if not can_manage_selected:
+        with st.form("viewer_note_form", clear_on_submit=True):
+            viewer_note = st.text_area("Add a note", placeholder="Add context or a question for the owning department")
+            note_submitted = st.form_submit_button("Add note")
+        if note_submitted and viewer_note.strip():
+            append_activity(activity_ws, selected_ticket_id, "note_added", "Note", "", "", viewer_note.strip())
+            st.success("Note added.")
+            st.rerun()
+
+    with st.expander("Ticket history"):
+        activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
+        history = request_history(activity_df, selected_ticket_id)
+        for entry in history:
+            stamp = pd.to_datetime(entry["timestamp"], errors="coerce", utc=True)
+            if pd.notna(stamp):
+                stamp = stamp.tz_convert("Africa/Nairobi")
+            when = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date unavailable"
+            with st.container(border=True):
+                st.markdown(f"**{entry['title']}**")
+                st.caption(when)
+                for detail in entry["details"]:
+                    st.text(detail)
+        if not history:
+            st.caption("No updates recorded for this request yet.")
+
+
 with tab_tickets:
     if st.button("Add new", type="primary", icon=":material/add:"):
+        close_ticket_editor()
         st.session_state["ticket_intake_open"] = True
     if st.session_state.get("ticket_intake_open"):
         add_ticket_dialog()
@@ -976,314 +1273,38 @@ with tab_tickets:
             "Status": editor_df["Status"].astype(str).str.capitalize(),
             "Reported": pd.to_datetime(editor_df["Reported_dt"], errors="coerce", utc=True).dt.tz_convert("Africa/Nairobi").dt.strftime("%d %b %Y"),
         })
-        st.dataframe(display, width="stretch", hide_index=True)
+        st.caption("Select a ticket to view or edit it.")
+        table_key = f"ticket_table_{st.session_state.get('ticket_edit_version', 0)}"
 
-        st.divider()
-        st.subheader("Manage support requests")
-        st.caption("Select one request to update its ownership, progress or callback status.")
-        selected_ticket_id = st.selectbox(
-            "Support request",
-            options=editor_df["Ticket ID"].tolist(),
-            format_func=lambda tid: " · ".join(
-                part for part in [
-                    ticket_labels[tid],
-                    normalize_text(editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].iloc[0]),
-                ] if part
-            ),
-        )
-        selected = editor_df.loc[editor_df["Ticket ID"] == selected_ticket_id].iloc[0]
-        render_request_deadlines(ws, selected_ticket_id)
-
-        st.caption(
-            f"{normalize_text(selected['Requester Type']) or 'Requester'}"
-            f"  •  {normalize_text(selected['Channel']) or 'Channel not recorded'}"
-            f"  •  Job ID: {normalize_text(selected['Job Request ID']) or 'Not applicable'}"
-            f"  •  Reg No: {normalize_text(selected['Reg No']) or 'Not recorded'}"
-        )
-        st.caption(
-            f"Owned by **{normalize_text(selected['Assigned Department']) or 'Unassigned department'}**"
-            + (f" · {normalize_text(selected['Assigned Sub-team'])}" if normalize_text(selected["Assigned Sub-team"]) else "")
-            + f"  •  Reported by {normalize_text(selected['Reporting Department']) or 'Unknown'}"
-        )
-        can_manage_selected = can_manage(
-            department=current_user.department, admin=is_admin_user, ticket_department=selected["Assigned Department"]
-        )
-        if not can_manage_selected:
-            st.info("This request is owned by another department. You have view-only access and can add a note below.")
-
-        # The reassignment department sits outside the form so choosing a department
-        # with sub-teams immediately reveals the required sub-team picker.
-        current_dept = normalize_department(selected["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
-        new_department = st.selectbox(
-            "Assigned department", DEPARTMENTS, index=DEPARTMENTS.index(current_dept),
-            key=f"reassign_dept_{selected_ticket_id}", disabled=not can_manage_selected,
-            help="Reassign this request to another department. Choosing a department with sub-teams requires selecting one below.",
-        )
-
-        with st.form("save_edits_form"):
-            corrected_reported_at = st.datetime_input(
-                "Reported at (Nairobi time)", value=nairobi_input_value(reported_time(selected)), key=f"edit_reported_at_{selected_ticket_id}",
-                help="Correct the actual reporting time. This recalculates SLA deadlines and leaves the dashboard entry timestamp unchanged.",
-            )
-            update_left, update_right = st.columns(2)
-            with update_left:
-                status_value = normalize_text(selected["Status"]).lower()
-                new_status = st.selectbox(
-                    "Status",
-                    options=STATUSES,
-                    index=STATUSES.index(status_value) if status_value in STATUSES else 0,
-                    help="Resolved requests can move directly to Closed. Add a resolution summary before saving.",
-                )
-                priority_value = normalize_text(selected["Priority"])
-                priority_options = ["Low", "Medium", "High", "Urgent"]
-                new_priority = st.selectbox(
-                    "Priority",
-                    options=priority_options,
-                    index=priority_options.index(priority_value) if priority_value in priority_options else 1,
-                )
-                new_assignee = st.text_input("Assigned support agent", value=normalize_text(selected["Assignee"]))
-            with update_right:
-                callback_value = normalize_text(selected["Callback Required"])
-                new_callback_required = st.checkbox("Callback required", value=callback_value == "Yes")
-                new_callback_deadline = st.text_input(
-                    "Callback deadline",
-                    value=normalize_text(selected["Callback Deadline"]),
-                    placeholder="YYYY-MM-DD HH:MM",
-                    disabled=not new_callback_required,
-                )
-                callback_done = st.checkbox(
-                    "Callback completed",
-                    value=bool(normalize_text(selected["Callback Completed At"])),
-                )
-
-            route_subteams = subteams_for(new_department)
-            if route_subteams:
-                current_subteam = clean_subteam(new_department, selected["Assigned Sub-team"])
-                route_options = ["— Select sub-team —"] + route_subteams
-                route_choice = st.selectbox(
-                    f"{new_department} sub-team *", route_options,
-                    index=route_options.index(current_subteam) if current_subteam in route_options else 0,
-                    help="Required for this department. Pick the exact team that owns this request.",
-                )
-                new_subteam = "" if route_choice.startswith("—") else route_choice
+        def select_ticket():
+            selection = st.session_state[table_key].selection
+            if selection.cells:
+                position = selection.cells[0][0]
+            elif selection.rows:
+                position = selection.rows[0]
             else:
-                new_subteam = ""
+                return
+            ticket = editor_df.iloc[position]
+            st.session_state["editing_ticket_id"] = ticket["Ticket ID"]
+            st.session_state["editing_ticket_revision"] = normalize_text(ticket["Updated At"])
 
-            resolution_summary = st.text_area(
-                "Resolution summary",
-                value=normalize_text(selected["Resolution Summary"]),
-                placeholder="What was done to resolve or progress this request?",
-            )
-            st.caption("Record when you first responded and understood the problem. Use Nairobi time; leave unknown times blank.")
-            response_column, diagnosis_column = st.columns(2)
-            with response_column:
-                first_response_at = st.datetime_input(
-                    "First response sent at", value=nairobi_input_value(selected["First Response At"]),
-                )
-                mark_responded = st.form_submit_button(
-                    "Mark responded",
-                    disabled=bool(normalize_text(selected["First Response At"])) or selected["Status"] == "closed" or not can_manage_selected,
-                    help="Record the first response as now and save the current form edits. Use only after responding to the requester.",
-                )
-            with diagnosis_column:
-                diagnosed_at = st.datetime_input(
-                    "Problem diagnosed at", value=nairobi_input_value(selected["Diagnosed At"]),
-                )
-                mark_diagnosed = st.form_submit_button(
-                    "Mark diagnosed",
-                    disabled=bool(normalize_text(selected["Diagnosed At"])) or selected["Status"] == "closed" or not can_manage_selected,
-                    help="Record diagnosis as now and save the current form edits. A To do request moves to Diagnosed.",
-                )
-            st.caption("Milestone buttons record the time now and save your form edits. Use the date fields to correct earlier times.")
-            update_note = st.text_area("Update note", placeholder="Add context for this change")
-            save_edits = st.form_submit_button("Save request update", type="primary", disabled=not can_manage_selected)
+        st.dataframe(display, width="stretch", hide_index=True, key=table_key,
+                     selection_mode=["single-row", "single-cell"], on_select=select_ticket)
 
-        if save_edits or mark_responded or mark_diagnosed:
-            if not can_manage_selected:
-                st.error("You do not have permission to edit this request.")
-                st.stop()
-            if subteams_for(new_department) and not clean_subteam(new_department, new_subteam):
-                st.error(f"Select a {new_department} sub-team before saving.")
-                st.stop()
-            base = read_df(ws, REQUIRED_HEADERS)
-            base = pd.DataFrame(base)
-            for col in REQUIRED_HEADERS:
-                if col not in base.columns:
-                    base[col] = ""
+    editing_id = st.session_state.get("editing_ticket_id")
+    if editing_id is not None and not st.session_state.get("ticket_intake_open"):
+        matches = scoped_df.loc[scoped_df["Ticket ID"].eq(editing_id)]
+        if matches.empty:
+            close_ticket_editor()
+            st.warning("This ticket is no longer available.")
+        else:
+            edit_ticket_dialog(matches.iloc[0], ticket_labels[editing_id])
 
-            if base["Ticket ID"].astype(str).duplicated().any():
-                st.error("Duplicate Ticket IDs were found. Resolve them before editing.")
-                st.stop()
+with tab_admin:
+    if can_delete(admin=is_admin_user) and not view.empty:
+        with st.expander("Delete tickets"):
+            render_ticket_deletion(view)
 
-            base_idx = base.set_index("Ticket ID", drop=False)
-            tid = selected_ticket_id
-            if tid not in base_idx.index:
-                st.error("This request no longer exists. Refresh to select another request.")
-                st.stop()
-            current = {col: normalize_text(base_idx.loc[tid, col]) for col in REQUIRED_HEADERS}
-            # Treat a legacy blank department as its normalized default so simply
-            # opening and saving a request does not log a phantom routing change.
-            current["Assigned Department"] = normalize_department(current["Assigned Department"]) or GLOBAL_VIEW_DEPARTMENT
-            proposed = current.copy()
-            if corrected_reported_at != nairobi_input_value(reported_time(selected)):
-                if corrected_reported_at is None:
-                    st.error("Set the date and time the request was reported.")
-                    st.stop()
-                proposed["Reported At"] = nairobi_timestamp(corrected_reported_at)
-            for field, entered in [("First Response At", first_response_at), ("Diagnosed At", diagnosed_at)]:
-                # Preserve the stored timestamp unless the user actually changes it.
-                if entered != nairobi_input_value(selected[field]):
-                    proposed[field] = nairobi_timestamp(entered)
-            proposed.update({
-                "Status": new_status,
-                "Priority": new_priority,
-                "Assignee": new_assignee.strip(),
-                "Callback Required": "Yes" if new_callback_required else "No",
-                "Callback Deadline": new_callback_deadline.strip() if new_callback_required else "",
-                "Callback Completed At": (
-                    current["Callback Completed At"] or datetime.now().astimezone().isoformat(timespec="seconds")
-                ) if callback_done else "",
-                "Resolution Summary": resolution_summary.strip(),
-                "Assigned Department": new_department,
-                "Assigned Sub-team": clean_subteam(new_department, new_subteam),
-            })
-            current["Status"] = current["Status"].lower()
-            now_stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-            reporting_changed = proposed["Reported At"] != current["Reported At"]
-            reported_stamp = pd.to_datetime(reported_time(proposed), errors="coerce", utc=True)
-            if reporting_changed and (pd.isna(reported_stamp) or reported_stamp > pd.Timestamp.now(tz="UTC") or reported_stamp > pd.to_datetime(current["Created"], utc=True)):
-                st.error("Reporting time must not be later than the dashboard entry time or now.")
-                st.stop()
-
-            if mark_responded or mark_diagnosed:
-                if current["Status"] == "closed":
-                    st.error("This request is already closed. Use the date fields to correct its recorded times.")
-                    st.stop()
-                field = "First Response At" if mark_responded else "Diagnosed At"
-                proposed[field] = current[field] or now_stamp
-                if mark_diagnosed and current["Status"] == "to do" and proposed["Status"] == "to do":
-                    proposed["Status"] = "diagnosed"
-
-            for field in ["First Response At", "Diagnosed At", "Resolved At", "Closed At"]:
-                if (proposed[field] != current[field] or reporting_changed) and proposed[field]:
-                    timestamp = pd.to_datetime(proposed[field], utc=True)
-                    received = reported_stamp
-                    closed = pd.to_datetime(current["Closed At"], errors="coerce", utc=True)
-                    if pd.isna(received) or timestamp < received or timestamp > pd.Timestamp.now(tz="UTC"):
-                        st.error(f"{field} must be between when the request was reported and now.")
-                        st.stop()
-                    if current["Status"] == "closed" and pd.notna(closed) and timestamp > closed:
-                        st.error(f"{field} cannot be after request closure.")
-                        st.stop()
-
-            if new_callback_required and new_callback_deadline and not valid_datetime(new_callback_deadline):
-                st.error("Callback deadline must use a valid date and time.")
-                st.stop()
-            if current["Status"] != proposed["Status"]:
-                if proposed["Status"] == "closed" and not proposed["Resolution Summary"]:
-                    st.error("Add a resolution summary before closing this request.")
-                    st.stop()
-                if not can_transition(current["Status"], proposed["Status"]):
-                    st.error(
-                        f"This request cannot move directly from {current['Status']} "
-                        f"to {proposed['Status']}. Follow the defined workflow."
-                    )
-                    st.stop()
-                if proposed["Status"] in ["diagnosed", "in progress", "qa testing", "deployed"] and not proposed["Diagnosed At"]:
-                    proposed["Diagnosed At"] = now_stamp
-                if proposed["Status"] in ["deployed", "closed"] and not proposed["Resolved At"]:
-                    proposed["Resolved At"] = now_stamp
-                if proposed["Status"] == "closed":
-                    proposed["Closed At"] = now_stamp
-                if current["Status"] == "closed" and proposed["Status"] != "closed":
-                    proposed["Closed At"] = ""
-
-            changed_fields = [
-                field for field in REQUIRED_HEADERS
-                if field not in ["Ticket ID", "Updated At"] and current[field] != proposed[field]
-            ]
-            if not changed_fields:
-                st.info("No changes to save.")
-                st.stop()
-
-            proposed["Updated At"] = now_stamp
-            update_ticket(ws, tid, proposed)
-            for field in changed_fields:
-                append_activity(
-                    activity_ws,
-                    ticket_id=tid,
-                    action="status_changed" if field == "Status" else "field_edited",
-                    field=field,
-                    old_value=current[field],
-                    new_value=proposed[field],
-                    note=update_note.strip(),
-                )
-
-            st.success("Support request updated.")
-            st.rerun()
-
-        if not can_manage_selected:
-            with st.form("viewer_note_form", clear_on_submit=True):
-                viewer_note = st.text_area("Add a note", placeholder="Add context or a question for the owning department")
-                note_submitted = st.form_submit_button("Add note")
-            if note_submitted and viewer_note.strip():
-                append_activity(activity_ws, selected_ticket_id, "note_added", "Note", "", "", viewer_note.strip())
-                st.success("Note added.")
-                st.rerun()
-
-        if can_delete(admin=is_admin_user):
-            st.divider()
-            colA, colB = st.columns([1, 1])
-            with colA:
-                delete_ids = st.multiselect(
-                    "Delete tickets (select by Summary)",
-                    options=editor_df["Ticket ID"].tolist(),
-                    format_func=lambda tid: editor_df.loc[editor_df["Ticket ID"] == tid, "Summary"].values[0],
-                )
-            with colB:
-                delete_note = st.text_input("Delete note (optional)", placeholder="Why is this ticket being deleted?")
-
-            if st.button("Delete selected"):
-                if not delete_ids:
-                    st.warning("Select at least one ticket to delete.")
-                    st.stop()
-                base = read_df(ws, REQUIRED_HEADERS)
-                base = pd.DataFrame(base)
-                doomed = base[base["Ticket ID"].isin(delete_ids)].copy()
-                for _, row in doomed.iterrows():
-                    append_activity(
-                        activity_ws,
-                        ticket_id=row["Ticket ID"],
-                        action="ticket_deleted",
-                        field="Status",
-                        old_value=row.get("Status", ""),
-                        new_value="",
-                        note=delete_note.strip(),
-                    )
-                delete_tickets(ws, delete_ids)
-                st.success(f"Deleted {len(delete_ids)} ticket(s).")
-                st.rerun()
-
-        st.divider()
-        st.subheader("History for this request")
-        activity_df = read_df(activity_ws, ACTIVITY_HEADERS)
-        request_label = normalize_text(selected["Support Request Number"]) or normalize_text(selected["Summary"])
-        st.caption(f"{request_label} · Updates to the request selected above, newest first.")
-        history = request_history(activity_df, selected_ticket_id)
-        for entry in history:
-            stamp = pd.to_datetime(entry["timestamp"], errors="coerce", utc=True)
-            if pd.notna(stamp):
-                stamp = stamp.tz_convert("Africa/Nairobi")
-            when = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date unavailable"
-            with st.container(border=True):
-                st.markdown(f"**{entry['title']}**")
-                st.caption(when)
-                for detail in entry["details"]:
-                    st.text(detail)
-        if not history:
-            st.caption("No updates recorded for this request yet.")
-
-with tab_tickets:
     # ---- WhatsApp intake ----
     if USE_DATABASE:
         # Reuse the connection pool without caching a store instance across app updates.
