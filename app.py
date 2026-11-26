@@ -912,6 +912,9 @@ def add_ticket_dialog():
         "Assigned Sub-team": subteam or "",
         "Reporting Department": current_user.department,
     })
+    active_card = st.session_state.get("ticket_card_filter", "Tickets")
+    if active_card == ("Open" if resolved else "Resolved"):
+        st.session_state["ticket_card_filter"] = "Tickets"
     st.session_state["new_ticket_saved"] = ticket_id
     close_ticket_intake()
     st.rerun()
@@ -1248,13 +1251,29 @@ with tab_tickets:
 
     ticket_ids = df.sort_values(["Created_dt", "Ticket ID"], na_position="first")["Ticket ID"]
     ticket_labels = {ticket_id: f"T-{number:03d}" for number, ticket_id in enumerate(ticket_ids, start=1)}
-    editor_df = view.copy()
-    tickets_total = len(editor_df)
-    tickets_closed = int(editor_df["Status"].eq("closed").sum())
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("Tickets", tickets_total)
-    metric_cols[1].metric("Open", tickets_total - tickets_closed)
-    metric_cols[2].metric("Resolved", tickets_closed)
+    closed = view["Status"].eq("closed")
+    active_card = st.session_state.get("ticket_card_filter", "Tickets")
+
+    def filter_ticket_cards(card):
+        if card != st.session_state.get("ticket_card_filter", "Tickets"):
+            close_ticket_editor()
+            st.session_state["ticket_card_filter"] = card
+
+    with st.container(key="ticket_cards"):
+        columns = st.columns(3)
+        cards = [("Tickets", len(view)), ("Open", int((~closed).sum())), ("Resolved", int(closed.sum()))]
+        for column, (card, count) in zip(columns, cards):
+            column.button(f"{card}  \n**{count:,}**", key=f"ticket_card_{card.lower()}",
+                          type="primary" if active_card == card else "secondary", width="stretch",
+                          on_click=filter_ticket_cards, args=(card,),
+                          help=f"Show {'all tickets' if card == 'Tickets' else card.lower() + ' tickets'}")
+
+    if active_card == "Open":
+        editor_df = view.loc[~closed]
+    elif active_card == "Resolved":
+        editor_df = view.loc[closed]
+    else:
+        editor_df = view
 
     if editor_df.empty:
         st.info("No support requests match the current filters.")

@@ -38,6 +38,19 @@ def apply_solvit_theme():
         h1 { font-weight: 800 !important; }
         h2, h3 { font-weight: 700 !important; }
         p, label, [data-testid="stCaptionContainer"] { color: var(--solvit-muted); }
+        .st-key-ticket_cards .stButton > button {
+            min-height: 90px;
+            justify-content: flex-start;
+            text-align: left;
+            padding: 12px 18px;
+        }
+        .st-key-ticket_cards .stButton > button p {
+            font-size: .85rem;
+        }
+        .st-key-ticket_cards .stButton > button strong {
+            font-size: 1.6rem;
+            line-height: 1.4;
+        }
         div[data-testid="stMetric"] {
             background: linear-gradient(180deg, #FFFFFF 0%, #FAFAFA 100%);
             border: 1px solid var(--solvit-border);

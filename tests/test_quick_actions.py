@@ -51,3 +51,32 @@ def test_quick_milestones_save_owner_and_activity_without_overwriting_response(t
         assert any("Last 7 days" in table.columns for table in tables)
     finally:
         st.cache_resource.clear()
+
+
+def test_ticket_cards_filter_the_register(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'cards.db').as_posix()}")
+    monkeypatch.setenv("USE_DATABASE", "true")
+    monkeypatch.setenv("DASHBOARD_PASSWORD_HASH", "")
+    tables = []
+    monkeypatch.setattr(st, "dataframe", lambda data, **kwargs: tables.append(data.copy()))
+    monkeypatch.setattr(st, "altair_chart", lambda *args, **kwargs: None)
+    st.cache_resource.clear()
+    tickets, _ = database_handles()
+    for status in ("to do", "in progress", "closed"):
+        row = {"Ticket ID": status, "Support Request Number": f"TEST-{status}", "Summary": status, "Status": status, "Created": "2026-09-04T10:00:00Z"}
+        tickets.append_row([row.get(field, "") for field in TICKET_HEADERS])
+
+    try:
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30).run()
+        for card, expected in (
+            ("open", {"to do", "in progress"}), ("resolved", {"closed"}),
+            ("tickets", {"to do", "in progress", "closed"}),
+        ):
+            tables.clear()
+            app.button(key=f"ticket_card_{card}").click().run()
+            assert not app.exception
+            table = next(frame for frame in tables if "Reg No / Request ID" in frame.columns)
+            assert set(table["Issue"]) == expected
+        assert len(tickets.get_all_records()) == 3
+    finally:
+        st.cache_resource.clear()
